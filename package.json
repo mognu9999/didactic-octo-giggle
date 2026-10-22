@@ -1,0 +1,13 @@
+{
+  "name": "vk-mat-bot",
+  "version": "3.0.0",
+  "description": "VK бот-модератор: удаляет мат, оскорбления, запрещённый контент и репосты из сообществ",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5"
+  }
+}
