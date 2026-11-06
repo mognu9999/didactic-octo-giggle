@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const axios = require('axios');
 const { containsProfanity } = require('./badwords');
 const { containsLgbt } = require('./lgbt');
+const { loadCustomWords, addCustomWord, removeCustomWord, containsCustomWord } = require('./userwords');
 const { checkForbidden, loadBlocklist } = require('./forbidden');
 
 // ---------------------------------------------------------------------------
@@ -69,8 +70,14 @@ const RULES_FILE_CANDIDATES = [
 const STATS_FILE = process.env.STATS_FILE || path.join(__dirname, 'stats.json');
 const CRYSTALS_PER_MESSAGE = Number(process.env.CRYSTALS_PER_MESSAGE) || 1;
 
-// Список слов, добавленных командой /запретить (удаляются без бана).
-const STOPWORDS_FILE = process.env.STOPWORDS_FILE || path.join(__dirname, 'stopwords.json');
+// Слова, добавленные командой /запретить (лежат рядом со статистикой, чтобы
+// один и тот же Volume хранил и то и другое).
+const WORDS_FILE = process.env.WORDS_FILE || path.join(path.dirname(STATS_FILE), 'custom_words.txt');
+
+// В каких единицах VK считает смещения жирного шрифта. По умолчанию — UTF-16
+// (как индексы строк в JS). Если жирное съезжает на 1-2 символа из-за эмодзи,
+// поставьте FORMAT_UNITS=codepoints.
+const FORMAT_UNITS = String(process.env.FORMAT_UNITS || 'utf16').toLowerCase();
 
 // Пишется один раз, когда бота добавляют в беседу.
 const BOT_ADDED_TEXT =
@@ -414,10 +421,10 @@ function wallTexts(att) {
 function checkText(text) {
   if (!text) return null;
   if (containsProfanity(text, { strict: true })) return 'мат/оскорбление';
+  const custom = containsCustomWord(text);
+  if (custom) return `запрещённое слово из /запретить: ${custom}`;
   const forbidden = checkForbidden(text);
   if (forbidden) return `запрещённый контент: ${forbidden}`;
-  const stop = checkStopwords(text);
-  if (stop) return `запрещённое слово: ${stop}`;
   return null;
 }
 
@@ -536,7 +543,7 @@ async function getUserName(userId) {
 }
 
 // ---------------------------------------------------------------------------
-// Команды: /правила, /бан, /кр
+// Команды: /правила, /бан, /кр, /к, /м, /запретить, /разрешить
 // ---------------------------------------------------------------------------
 
 function sendMessage(peerId, text, extra = {}) {
@@ -549,18 +556,65 @@ function sendMessage(peerId, text, extra = {}) {
   });
 }
 
-// Команды без аргументов ("/правила", "/бан", "/кр") принимаются только в точном
-// виде — иначе сообщение идёт на обычную проверку. Команды "/запретить",
-// "/разрешить" и "/м" принимают аргументы.
-const ARG_COMMANDS = new Set(['запретить', 'разрешить', 'м']);
-function parseCommand(text) {
-  const m = /^\/(правила|бан|кр|запретить|разрешить|м)(?:@\S+)?(?:\s+([\s\S]*))?$/i.exec(String(text || '').trim());
-  if (!m) return null;
-  const cmd = m[1].toLowerCase();
-  const args = (m[2] || '').trim();
-  if (args && !ARG_COMMANDS.has(cmd)) return null;
-  return { cmd, args };
+// Ответ именно reply-ем на сообщение пользователя. Если VK reply не принял —
+// отправляем обычным сообщением, чтобы ответ не потерялся.
+async function replyTo(message, text, extra = {}) {
+  try {
+    return await sendMessage(message.peer_id, text, {
+      ...extra,
+      forward: {
+        peer_id: message.peer_id,
+        conversation_message_ids: [message.conversation_message_id],
+        is_reply: true,
+      },
+    });
+  } catch (e) {
+    if (e.vkCode === undefined) throw e;
+    console.error(`[reply] reply не удался (${e.message}), отправляю обычным сообщением`);
+    return sendMessage(message.peer_id, text, extra);
+  }
 }
+
+const COMMAND_RE = /^\/(правила|запретить|разрешить|бан|кр|к|м)(?:@\S+)?(?:\s+([\s\S]*))?$/i;
+
+// "/м 100 @user" -> { cmd: 'м', args: '100 @user' }
+function parseCommand(text) {
+  const m = COMMAND_RE.exec(String(text || '').trim());
+  if (!m) return null;
+  return { cmd: m[1].toLowerCase(), args: (m[2] || '').trim() };
+}
+
+// Сообщение, на которое ответил автор команды (reply или единственное пересланное).
+function replyTarget(message) {
+  if (message.reply_message) return message.reply_message;
+  if (Array.isArray(message.fwd_messages) && message.fwd_messages.length === 1) return message.fwd_messages[0];
+  return null;
+}
+
+// --- /правила ---------------------------------------------------------------
+
+// Текст по умолчанию. Если рядом с index.js лежит непустой "Правила short.txt"
+// (или RULES_FILE) — берётся текст из файла.
+const DEFAULT_RULES_TEXT = `🔊 Правила официального комьюнити
+ООО «Я ТЕБЯ НИКОГДА НЕ ПРЕДАМ. 3»:
+
+▪️ Уважайте участников и их мнения.
+▪️ Запрещены: оскорбления, спам, реклама, политика, ложь о компании
+ООО «Я ТЕБЯ НИКОГДА НЕ ПРЕДАМ. 3».
+▪️ Запрещена публикация в официальном комьюнити информации и материалов запрещённых к публикации в информационном пространстве на территории Российской Федерации.
+▪️ Ссылки, розыгрыши и призывы к сделкам — только с одобрения админов.
+▪️ Фишинг, мошенничество и токсичность — строго запрещены.
+▪️ Админы никогда не пишут первыми. Будьте внимательны!
+
+⚠️ Негативные высказывания о компании
+ООО «Я ТЕБЯ НИКОГДА НЕ ПРЕДАМ. 3» или провокации:
+— 1-й раз: предупреждение и удаление сообщения.
+— 2-й раз: бан без возврата.
+
+Спасибо, что соблюдаете правила и помогаете сохранить безопасную атмосферу в нашем сообществе!
+
+Команда 
+ООО «Я ТЕБЯ НИКОГДА НЕ ПРЕДАМ. 3» 🖤`;
 
 function loadRulesText() {
   for (const file of RULES_FILE_CANDIDATES) {
@@ -571,53 +625,56 @@ function loadRulesText() {
       if (e.code !== 'ENOENT') console.error(`Не удалось прочитать ${file}:`, e.message);
     }
   }
-  return null;
+  return DEFAULT_RULES_TEXT.replace(/\r\n?/g, '\n').trim();
 }
 
-// Название компании: от первой заглавной буквы «О» до закрывающей «»».
-// Учитывает вложенные кавычки: «ООО «Ромашка «Плюс»»» закроется на последней.
-// Возвращает { offset, length } или null.
-function findCompanyName(text) {
-  const start = text.indexOf('О');
-  if (start === -1) return null;
-  let depth = 0;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (ch === '«') depth++;
-    else if (ch === '»') {
-      depth--;
-      if (depth <= 0) return { offset: start, length: i - start + 1 };
-    }
-  }
-  return null;
+// Название компании: от «ООО» (или «Общество с ограниченной ответственностью»)
+// до закрывающей «»». Находит ВСЕ вхождения. Возвращает [{ start, end }] —
+// индексы в строке JS (end не включительно).
+function findCompanyNames(text) {
+  const re = /(?:ООО|Общество с ограниченной ответственностью)\s*«[^»]*»/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(text))) out.push({ start: m.index, end: m.index + m[0].length });
+  return out;
+}
+
+function toUnits(text, from, to) {
+  const part = text.slice(from, to);
+  return FORMAT_UNITS === 'codepoints' ? Array.from(part).length : part.length;
+}
+
+function buildBoldFormat(text) {
+  const items = findCompanyNames(text).map(({ start, end }) => ({
+    type: 'bold',
+    offset: toUnits(text, 0, start),
+    length: toUnits(text, start, end),
+  }));
+  return items.length ? { version: '1', items } : null;
 }
 
 async function handleRulesCommand(message) {
   const text = loadRulesText();
-  if (!text) {
-    console.error('[rules] файл с правилами не найден или пуст: положите "Правила short.txt" рядом с index.js');
-    return;
+  const format = buildBoldFormat(text);
+  const extra = format ? { format_data: format } : {};
+  try {
+    await sendMessage(message.peer_id, text, extra);
+  } catch (e) {
+    if (e.vkCode === undefined || !format) throw e;
+    // Если VK не принял форматирование — всё равно отправляем правила, но без жирного.
+    console.error(`[rules] VK не принял format_data (${e.message}), отправляю без жирного`);
+    await sendMessage(message.peer_id, text);
   }
-  const extra = {};
-  const name = findCompanyName(text);
-  if (name) {
-    // Смещения в UTF-16, как и индексы строк в JS — совпадает с тем, что ждёт VK.
-    extra.format_data = {
-      version: '1',
-      items: [{ type: 'bold', offset: name.offset, length: name.length }],
-    };
-  }
-  await sendMessage(message.peer_id, text, extra);
 }
+
+// --- /бан -------------------------------------------------------------------
 
 async function handleBanCommand(message) {
   const peerId = message.peer_id;
   const adminId = message.from_id;
   if (!(await isChatAdmin(peerId, adminId))) return; // банить могут только админы и владелец
 
-  const target =
-    message.reply_message ||
-    (Array.isArray(message.fwd_messages) && message.fwd_messages.length === 1 ? message.fwd_messages[0] : null);
+  const target = replyTarget(message);
   const targetId = target && target.from_id;
   if (!(targetId > 0)) {
     console.log(`[ban] peer=${peerId}: /бан без ответа на сообщение участника — ничего не делаю`);
@@ -631,258 +688,193 @@ async function handleBanCommand(message) {
   await kickUser(peerId, targetId, `команда /бан от ${adminId}`);
 }
 
+// --- /запретить и /разрешить ------------------------------------------------
+
+async function handleWordCommand(cmd, message, args) {
+  if (!(await isChatAdmin(message.peer_id, message.from_id))) return; // только админы и владелец
+  if (!args) {
+    return replyTo(message, `Укажите слово: /${cmd} слово`);
+  }
+  if (cmd === 'запретить') {
+    const r = addCustomWord(args);
+    if (r.status === 'added') {
+      console.log(`[words] добавлено "${r.word}" (админ ${message.from_id})`);
+      return replyTo(message, `Слово «${r.word}» добавлено в список удаляемых.`);
+    }
+    if (r.status === 'exists') return replyTo(message, `Слово «${r.word}» уже в списке.`);
+    if (r.status === 'too_long') return replyTo(message, 'Слишком длинно (максимум 100 символов).');
+    return replyTo(message, 'Слишком короткое слово: нужно минимум 3 символа.');
+  }
+  const r = removeCustomWord(args);
+  if (r.status === 'removed') {
+    console.log(`[words] убрано "${r.word}" (админ ${message.from_id})`);
+    return replyTo(message, `Слово «${r.word}» убрано из списка.`);
+  }
+  return replyTo(message, `Слова «${r.word}» нет в списке, добавленном через /запретить.`);
+}
+
+// --- кристаллы: /кр и /к ----------------------------------------------------
+
 async function handleCrystalsCommand(message) {
   const rec = getStat(message.peer_id, message.from_id);
   const name = await getUserName(message.from_id);
   await sendMessage(message.peer_id, `${name} у вас ${rec.crystals} ${pluralCrystals(rec.crystals)}`);
 }
 
-// ---------------------------------------------------------------------------
-// Стоп-слова: /запретить и /разрешить (только для админов и владельца беседы)
-// ---------------------------------------------------------------------------
-// Правила те же, что в blocklist.txt: слово ловится с начала и с любым окончанием
-// ("реклам" поймает "реклама", "рекламу"), "$" в конце — слово целиком, пробел
-// в фразе заменяет любое количество пробелов, регистр и "ё" не важны.
-
-let stopwords = []; // нормализованные строки
-const stopRegexCache = new Map();
-
-function normWord(w) {
-  return String(w || '')
-    .replace(/[\u00AD\u200B-\u200F\u2060\uFEFF]/g, '')
-    .toLowerCase()
-    .replace(/ё/g, 'е')
-    .replace(/\s+/g, ' ')
-    .trim();
+// /к — ответ reply-ем на сообщение с командой.
+async function handleShortCrystalsCommand(message) {
+  const rec = getStat(message.peer_id, message.from_id);
+  await replyTo(message, `💎 У вас ${rec.crystals} ${pluralCrystals(rec.crystals)}`);
 }
 
-function stripQuotes(s) {
-  return String(s || '').trim().replace(/^[«"“„'`]+|[»"”'`]+$/g, '').trim();
-}
+// --- /м: бросок монетки на кристаллы ----------------------------------------
 
-function stopRegex(word) {
-  let re = stopRegexCache.get(word);
-  if (re) return re;
-  const whole = word.endsWith('$');
-  const core = whole ? word.slice(0, -1) : word;
-  const body = core
-    .split(' ')
-    .map((x) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
-    .join('\\s+');
-  re = new RegExp(`(?<![а-яa-z0-9])${body}${whole ? '(?![а-яa-z0-9])' : ''}`, 'i');
-  stopRegexCache.set(word, re);
-  return re;
-}
+const duels = new Map(); // id -> { peerId, challengerId, opponentId, amount, at }
+const DUEL_TTL_MS = 10 * 60 * 1000;
 
-function checkStopwords(text) {
-  if (!text || !stopwords.length) return null;
-  const t = normWord(text);
-  for (const w of stopwords) if (stopRegex(w).test(t)) return w;
-  return null;
-}
-
-function loadStopwords(filePath) {
-  try {
-    const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-    if (Array.isArray(data)) stopwords = data.map(normWord).filter(Boolean);
-    console.log(`Стоп-слова (/запретить): ${stopwords.length} записей`);
-  } catch (e) {
-    if (e.code !== 'ENOENT') console.error('Не удалось прочитать stopwords.json:', e.message);
-  }
-}
-
-function saveStopwords() {
-  if (!persistStats) return;
-  const tmp = `${STOPWORDS_FILE}.tmp`;
-  try {
-    fs.writeFileSync(tmp, JSON.stringify(stopwords));
-    fs.renameSync(tmp, STOPWORDS_FILE);
-  } catch (e) {
-    console.error('Не удалось сохранить stopwords.json:', e.message);
-  }
-}
-
-async function handleWordCommand(cmd, args, message) {
-  const peerId = message.peer_id;
-  if (!(await isChatAdmin(peerId, message.from_id))) return false; // не админ — обычная проверка сообщения
-
-  const word = normWord(stripQuotes(args));
-  if (!word) {
-    await sendMessage(peerId, `Напишите слово: /${cmd} слово`);
-    return true;
-  }
-  if (cmd === 'запретить') {
-    if (word.replace(/\$$/, '').replace(/\s/g, '').length < 3) {
-      await sendMessage(peerId, 'Слишком короткое слово: нужно минимум 3 буквы.');
-    } else if (stopwords.includes(word)) {
-      await sendMessage(peerId, `«${word}» уже в списке.`);
-    } else {
-      stopwords.push(word);
-      saveStopwords();
-      console.log(`[stopwords] добавлено "${word}" (админ ${message.from_id})`);
-      await sendMessage(peerId, `Готово: «${word}» добавлено в список, такие сообщения будут удаляться.`);
-    }
-  } else {
-    const idx = stopwords.indexOf(word);
-    if (idx === -1) {
-      await sendMessage(peerId, `«${word}» нет в списке, добавленном командой /запретить.`);
-    } else {
-      stopwords.splice(idx, 1);
-      stopRegexCache.delete(word);
-      saveStopwords();
-      console.log(`[stopwords] удалено "${word}" (админ ${message.from_id})`);
-      await sendMessage(peerId, `Готово: «${word}» убрано из списка.`);
-    }
-  }
-  return true;
-}
-
-// ---------------------------------------------------------------------------
-// Монетка: /м <ставка> (ответом на сообщение или с упоминанием/username)
-// ---------------------------------------------------------------------------
-
-const BET_TTL_MS = 5 * 60 * 1000;
-const bets = new Map(); // id -> { peerId, from, to, amount, cmid, text, at }
-
-function cleanBets() {
+function pruneDuels() {
   const now = Date.now();
-  for (const [id, b] of bets) if (now - b.at > BET_TTL_MS) bets.delete(id);
+  for (const [id, d] of duels) if (now - d.at > DUEL_TTL_MS) duels.delete(id);
 }
 
-function mention(id, name) {
-  return `[id${id}|${name}]`;
-}
+// "100 @durov", "[id1|Павел] 50", "durov 100" -> { amount, mentionId, screen }
+function parseDuelArgs(args) {
+  let rest = String(args || '');
+  let mentionId = null;
+  let screen = null;
 
-// Ищем соперника: ответ на сообщение -> упоминание [id123|Имя] -> username/ссылка.
-async function findOpponent(message, args) {
-  const reply =
-    message.reply_message ||
-    (Array.isArray(message.fwd_messages) && message.fwd_messages.length === 1 ? message.fwd_messages[0] : null);
-  let rest = args;
-  let opponentId = reply && reply.from_id > 0 ? reply.from_id : null;
-
-  const mm = /\[id(\d+)\|[^\]]*\]/.exec(rest);
-  if (mm) {
-    if (!opponentId) opponentId = Number(mm[1]);
-    rest = rest.replace(mm[0], ' ');
-  }
-
-  const tokens = rest.split(/\s+/).filter(Boolean);
-  const ai = tokens.findIndex((t) => /^\d+$/.test(t));
-  const amountTok = ai === -1 ? null : tokens.splice(ai, 1)[0];
-
-  if (!opponentId) {
-    for (const tok of tokens) {
-      const url = /(?:https?:\/\/)?(?:m\.)?vk\.(?:com|ru)\/([a-z0-9_.]+)/i.exec(tok);
-      const name = (url ? url[1] : tok.replace(/^@/, '')).trim();
-      if (!/^[a-z0-9_.]{3,32}$/i.test(name)) continue;
-      try {
-        const res = await callApi('users.get', { user_ids: name });
-        if (Array.isArray(res) && res[0] && res[0].id > 0) {
-          opponentId = res[0].id;
-          break;
-        }
-      } catch (e) {
-        /* не нашли — пробуем следующий токен */
-      }
+  const mention = /\[id(\d+)\|[^\]]*\]/.exec(rest);
+  if (mention) {
+    mentionId = Number(mention[1]);
+    rest = rest.replace(mention[0], ' ');
+  } else {
+    const link = /(?:@|vk\.com\/|vk\.ru\/)([A-Za-z0-9_.]{2,})/i.exec(rest);
+    if (link) {
+      screen = link[1];
+      rest = rest.replace(link[0], ' ');
     }
-    if (!opponentId && tokens.length) return { notFound: true, amountTok };
   }
-  return { opponentId, amountTok };
+
+  let amount = null;
+  const num = /(?<![\w.\-])(\d{1,12})(?![\w.])/.exec(rest);
+  if (num) {
+    amount = Number(num[1]);
+    rest = rest.replace(num[0], ' ');
+  }
+
+  // Ник без "@": "/м 100 durov"
+  if (!mentionId && !screen) {
+    const bare = rest.trim();
+    if (/^[A-Za-z0-9_.]{2,}$/.test(bare)) screen = bare;
+  }
+  return { amount, mentionId, screen };
 }
 
-async function handleCoinCommand(args, message) {
-  cleanBets();
+async function handleDuelCommand(message, args) {
   const peerId = message.peer_id;
-  const from = message.from_id;
+  const challengerId = message.from_id;
+  const parsed = parseDuelArgs(args);
 
-  const { opponentId, amountTok, notFound } = await findOpponent(message, args);
-  if (notFound) {
-    await sendMessage(peerId, 'Не нашёл такого пользователя. Ответьте на его сообщение или укажите его username.');
-    return;
+  // Кто соперник: reply на сообщение > упоминание > username.
+  let opponentId = null;
+  const target = replyTarget(message);
+  if (target && target.from_id > 0) {
+    opponentId = target.from_id;
+  } else if (parsed.mentionId) {
+    opponentId = parsed.mentionId;
+  } else if (parsed.screen) {
+    try {
+      const res = await callApi('users.get', { user_ids: parsed.screen });
+      if (Array.isArray(res) && res[0] && res[0].id) opponentId = res[0].id;
+    } catch (e) {
+      /* не нашли */
+    }
+    if (!opponentId) return replyTo(message, 'Не нашёл такого пользователя. Проверьте username или ответьте на его сообщение.');
   }
+
   if (!opponentId) {
-    await sendMessage(
-      peerId,
-      'Ответьте на сообщение пользователя с которым хотите подкинуть монетку, или укажите его username'
+    return replyTo(
+      message,
+      'Ответьте на сообщение пользователя, с которым хотите подкинуть монетку, или укажите его username'
     );
-    return;
   }
-  if (!amountTok) {
-    await sendMessage(peerId, 'Укажите ставку числом, например: /м 50');
-    return;
-  }
-  const amount = parseInt(amountTok, 10);
-  if (!(amount >= 1)) {
-    await sendMessage(peerId, 'Ставка должна быть больше нуля.');
-    return;
-  }
-  if (opponentId === from) {
-    await sendMessage(peerId, 'Нельзя бросать монетку с самим собой.');
-    return;
+  if (opponentId === challengerId) return replyTo(message, 'Нельзя кидать монетку с самим собой.');
+
+  const amount = parsed.amount;
+  if (!amount || !Number.isSafeInteger(amount) || amount < 1) {
+    return replyTo(message, 'Укажите ставку в кристаллах, например: /м 100');
   }
 
-  const mine = getStat(peerId, from).crystals;
+  const mine = getStat(peerId, challengerId).crystals;
   if (mine < amount) {
-    await sendMessage(peerId, `У вас только ${mine} ${pluralCrystals(mine)}, ставка ${amount} не получится.`);
-    return;
+    return replyTo(message, `Не хватает кристаллов: у вас ${mine} ${pluralCrystals(mine)}, а ставка ${amount}.`);
   }
   const theirs = getStat(peerId, opponentId).crystals;
+  const [challengerName, opponentName] = await Promise.all([getUserName(challengerId), getUserName(opponentId)]);
   if (theirs < amount) {
-    const oName = await getUserName(opponentId);
-    await sendMessage(peerId, `У ${oName} только ${theirs} ${pluralCrystals(theirs)}, ставка ${amount} не получится.`);
-    return;
+    return replyTo(message, `У ${opponentName} не хватает кристаллов: ${theirs} ${pluralCrystals(theirs)}, а ставка ${amount}.`);
   }
 
-  const [aName, bName] = await Promise.all([getUserName(from), getUserName(opponentId)]);
-  const id = crypto.randomBytes(5).toString('hex');
-  const text =
-    `${mention(from, aName)} предлагает ${mention(opponentId, bName)} подкинуть монетку ` +
-    `на ${amount} ${pluralCrystals(amount)}. Кидаем?`;
-  const btn = (label, a, color) => ({
-    action: { type: 'callback', label, payload: JSON.stringify({ c: 'coin', id, a }) },
-    color,
-  });
-  const res = await callApi('messages.send', {
-    peer_ids: peerId,
-    random_id: crypto.randomInt(1, 2147483647),
-    message: text,
-    keyboard: { inline: true, buttons: [[btn('Кидаем', 'yes', 'positive'), btn('Нет', 'no', 'negative')]] },
-  });
-  const cmid = Array.isArray(res) && res[0] ? res[0].conversation_message_id : null;
-  bets.set(id, { peerId, from, to: opponentId, amount, cmid, text, at: Date.now() });
+  pruneDuels();
+  const id = crypto.randomBytes(6).toString('hex');
+  duels.set(id, { peerId, challengerId, opponentId, amount, at: Date.now() });
+
+  const keyboard = {
+    inline: true,
+    buttons: [
+      [
+        { action: { type: 'callback', label: 'Кидаем', payload: JSON.stringify({ duel: id, act: 'yes' }) }, color: 'positive' },
+        { action: { type: 'callback', label: 'Нет', payload: JSON.stringify({ duel: id, act: 'no' }) }, color: 'negative' },
+      ],
+    ],
+  };
+  await replyTo(
+    message,
+    `🪙 ${challengerName} предлагает [id${opponentId}|${opponentName}] подкинуть монетку на ${amount} ${pluralCrystals(amount)}. Кидаем?`,
+    { keyboard, disable_mentions: 0 }
+  );
 }
 
-async function answerEvent(ev, snackbar) {
-  try {
-    await callApi('messages.sendMessageEventAnswer', {
-      event_id: ev.event_id,
-      user_id: ev.user_id,
-      peer_id: ev.peer_id,
-      event_data: snackbar ? { type: 'show_snackbar', text: snackbar } : undefined,
-    });
-  } catch (e) {
-    console.error('Не удалось ответить на нажатие кнопки:', e.message);
-  }
-}
+async function runCoinFlip(duel) {
+  const { peerId, challengerId, opponentId, amount } = duel;
+  const [challengerName, opponentName] = await Promise.all([getUserName(challengerId), getUserName(opponentId)]);
 
-async function clearKeyboard(bet) {
-  if (!bet.cmid) return;
-  try {
-    await callApi('messages.edit', {
-      peer_id: bet.peerId,
-      conversation_message_id: bet.cmid,
-      message: bet.text,
-      keyboard: { inline: true, buttons: [] },
-      group_id: GROUP_ID,
-    });
-  } catch (e) {
-    /* не критично: ставка и так закрыта */
+  // Дальше до списания нет await — два броска не смогут одновременно потратить одни и те же кристаллы.
+  const a = getStat(peerId, challengerId);
+  const b = getStat(peerId, opponentId);
+  if (a.crystals < amount || b.crystals < amount) {
+    const who = a.crystals < amount ? challengerName : opponentName;
+    return sendMessage(peerId, `Бросок отменён: у ${who} уже не хватает кристаллов на ставку.`);
   }
+
+  const challengerWins = crypto.randomInt(2) === 0;
+  const winner = challengerWins ? a : b;
+  const loser = challengerWins ? b : a;
+  loser.crystals -= amount;
+  winner.crystals += amount;
+  scheduleStatsSave();
+
+  const winnerName = challengerWins ? challengerName : opponentName;
+  const loserName = challengerWins ? opponentName : challengerName;
+  console.log(`[coin] peer=${peerId} победитель=${challengerWins ? challengerId : opponentId} ставка=${amount}`);
+  await sendMessage(
+    peerId,
+    `🪙 Монетка подброшена! Побеждает ${winnerName}.\n` +
+      `${loserName} теряет ${amount} ${pluralCrystals(amount)}, они переходят к ${winnerName}.\n` +
+      `Теперь у ${winnerName}: ${winner.crystals} ${pluralCrystals(winner.crystals)}.`
+  );
 }
 
 // Нажатие инлайн-кнопки (событие message_event).
-async function handleMessageEvent(ev) {
+async function handleEvent(ev) {
+  const answer = (text) =>
+    callApi('messages.sendMessageEventAnswer', {
+      event_id: ev.event_id,
+      user_id: ev.user_id,
+      peer_id: ev.peer_id,
+      event_data: text ? { type: 'show_snackbar', text } : undefined,
+    }).catch((e) => console.error('[event] не удалось ответить на нажатие:', e.message));
+
   let payload = ev.payload;
   if (typeof payload === 'string') {
     try {
@@ -891,62 +883,36 @@ async function handleMessageEvent(ev) {
       payload = null;
     }
   }
-  if (!payload || payload.c !== 'coin') return answerEvent(ev);
+  if (!payload || !payload.duel) return answer();
 
-  const bet = bets.get(payload.id);
-  if (!bet || bet.peerId !== ev.peer_id || Date.now() - bet.at > BET_TTL_MS) {
-    bets.delete(payload.id);
-    return answerEvent(ev, 'Ставка устарела');
-  }
-  const user = ev.user_id;
-  const allowed = payload.a === 'yes' ? user === bet.to : user === bet.to || user === bet.from;
-  if (!allowed) return answerEvent(ev, 'Эта ставка не для вас');
+  pruneDuels();
+  const duel = duels.get(payload.duel);
+  if (!duel || duel.peerId !== ev.peer_id) return answer('Этот бросок уже недействителен');
 
-  bets.delete(payload.id); // ставка закрыта — повторные нажатия уже не сработают
-  await answerEvent(ev);
-  clearKeyboard(bet);
-
-  if (payload.a !== 'yes') {
-    await sendMessage(bet.peerId, 'Пользователь отменил бросок монетки');
+  if (payload.act === 'no') {
+    if (ev.user_id !== duel.opponentId && ev.user_id !== duel.challengerId) return answer('Эта кнопка не для вас');
+    duels.delete(payload.duel);
+    await answer();
+    await sendMessage(duel.peerId, 'Пользователь отменил бросок монетки');
     return;
   }
-
-  const a = getStat(bet.peerId, bet.from);
-  const b = getStat(bet.peerId, bet.to);
-  if (a.crystals < bet.amount || b.crystals < bet.amount) {
-    await sendMessage(bet.peerId, 'Бросок отменён: у одного из участников не хватает кристаллов.');
+  if (payload.act === 'yes') {
+    if (ev.user_id !== duel.opponentId) return answer('Принять бросок может только тот, кого вызвали');
+    duels.delete(payload.duel);
+    await answer();
+    await runCoinFlip(duel);
     return;
   }
-
-  const fromWins = crypto.randomInt(2) === 0;
-  const winner = fromWins ? a : b;
-  const loser = fromWins ? b : a;
-  const winnerId = fromWins ? bet.from : bet.to;
-  const loserId = fromWins ? bet.to : bet.from;
-  loser.crystals -= bet.amount;
-  winner.crystals += bet.amount;
-  scheduleStatsSave();
-
-  const [wName, lName] = await Promise.all([getUserName(winnerId), getUserName(loserId)]);
-  await sendMessage(
-    bet.peerId,
-    `Монетка подброшена! Побеждает ${wName}: +${bet.amount} ${pluralCrystals(bet.amount)}. ` +
-      `У ${lName} −${bet.amount}.\n` +
-      `Баланс: ${wName} — ${winner.crystals}, ${lName} — ${loser.crystals}.`
-  );
+  return answer();
 }
 
-// Возвращает false, если команду надо не выполнять, а проверить сообщение как обычное.
 async function handleCommand({ cmd, args }, message) {
   if (cmd === 'правила') return handleRulesCommand(message);
   if (cmd === 'бан') return handleBanCommand(message);
   if (cmd === 'кр') return handleCrystalsCommand(message);
-  if (cmd === 'запретить' || cmd === 'разрешить') return handleWordCommand(cmd, args, message);
-  if (cmd === 'м') {
-    // Текст в команде не должен обходить фильтр: нарушение — обычная модерация.
-    if (inspectMessage(message)) return false;
-    return handleCoinCommand(args, message);
-  }
+  if (cmd === 'к') return handleShortCrystalsCommand(message);
+  if (cmd === 'м') return handleDuelCommand(message, args);
+  if (cmd === 'запретить' || cmd === 'разрешить') return handleWordCommand(cmd, message, args);
 }
 
 // ---------------------------------------------------------------------------
@@ -977,13 +943,16 @@ async function handleMessage(message, edited = false) {
 
   if (!(message.from_id > 0)) return; // сообщества/боты
 
-  // Команды — только точное совпадение ("/правила", "/бан", "/кр"), так что
-  // через них нельзя протащить запрещённый текст.
-  if (!edited) {
-    const parsed = parseCommand(message.text);
-    if (parsed) {
-      const handled = await handleCommand(parsed, message);
-      if (handled !== false) return;
+  // Команды: /правила, /бан, /кр, /к, /м, /запретить, /разрешить.
+  // Команда без аргументов обрабатывается сразу. Команда с аргументами сначала
+  // проходит обычную проверку текста (иначе через неё можно было бы протащить
+  // запрещённое). Исключение — /запретить и /разрешить от админов: слово,
+  // которое они вносят в список, не должно считаться нарушением.
+  const parsed = edited ? null : parseCommand(message.text);
+  if (parsed) {
+    const adminWordCmd = parsed.cmd === 'запретить' || parsed.cmd === 'разрешить';
+    if (!parsed.args || (adminWordCmd && (await isChatAdmin(peerId, message.from_id)))) {
+      return handleCommand(parsed, message);
     }
   }
 
@@ -1003,6 +972,9 @@ async function handleMessage(message, edited = false) {
     return;
   }
   if (reason) return removeMessage(message, reason);
+
+  // Команда с аргументами, прошедшая проверку, — выполняем (кристаллы за неё не дают).
+  if (parsed) return handleCommand(parsed, message);
 
   // Сообщение прошло проверку — начисляем кристаллы (правки не считаются).
   if (!edited) addCrystals(peerId, message.from_id);
@@ -1032,10 +1004,10 @@ function dispatchUpdate(update) {
   const obj = update.object || {};
   if (update.type === 'message_new') {
     handleMessage(obj.message).catch((e) => console.error('Ошибка обработки сообщения:', e));
+  } else if (update.type === 'message_event') {
+    handleEvent(obj).catch((e) => console.error('Ошибка обработки нажатия кнопки:', e));
   } else if (update.type === 'message_edit') {
     handleMessage(obj.message || obj, true).catch((e) => console.error('Ошибка обработки правки:', e));
-  } else if (update.type === 'message_event') {
-    handleMessageEvent(obj).catch((e) => console.error('Ошибка обработки нажатия кнопки:', e));
   }
 }
 
@@ -1084,19 +1056,10 @@ async function start() {
   if (ALLOWED_GROUP_IDS.size) {
     console.log(`Репосты разрешены из сообществ: ${[...ALLOWED_GROUP_IDS].join(', ')}`);
   }
+  const nWords = loadCustomWords(WORDS_FILE);
+  console.log(`Слова из /запретить (${WORDS_FILE}): ${nWords}`);
   loadStats(STATS_FILE);
-  loadStopwords(STOPWORDS_FILE);
   persistStats = true;
-  // Кнопки "Кидаем"/"Нет" шлют событие message_event — включаем его в Long Poll.
-  // Если у ключа нет права управления сообществом, включите вручную (см. инструкцию).
-  try {
-    await callApi('groups.setLongPollSettings', {
-      group_id: GROUP_ID, enabled: 1, message_new: 1, message_edit: 1, message_event: 1,
-    });
-    console.log('Long Poll: события сообщений и нажатий кнопок включены');
-  } catch (e) {
-    console.warn(`Не удалось включить message_event автоматически (${e.message}). Включите вручную в настройках API сообщества.`);
-  }
   const flush = () => saveStatsNow();
   process.on('SIGTERM', () => {
     flush();
@@ -1130,12 +1093,15 @@ module.exports = {
   parseGroupList,
   loadAllowedGroups,
   ALLOWED_GROUP_IDS,
-  findCompanyName,
+  findCompanyNames,
+  loadRulesText,
   parseCommand,
+  parseDuelArgs,
+  handleEvent,
+  duels,
+  getStat,
+  loadCustomWordsForTests: loadCustomWords,
   pluralCrystals,
-  handleMessageEvent,
-  checkStopwords,
-  bets,
   _config: () => ({ TOKEN, GROUP_ID }),
   _setApi: (fn) => {
     callApi = fn;
