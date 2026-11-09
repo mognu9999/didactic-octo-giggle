@@ -586,7 +586,7 @@ async function replyTo(message, text, extra = {}) {
 const TARGET_SRC =
   '(?:\\[id\\d+\\|[^\\]]*\\]|@[A-Za-z0-9_.]{2,}|(?:https?:\\/\\/)?(?:m\\.)?vk\\.(?:com|ru)\\/[A-Za-z0-9_.]{2,}|[A-Za-z][A-Za-z0-9_.]{2,31})';
 const SLASH_RE = /^\/(запретить|разрешить)(?:@\S+)?(?:\s+([\s\S]*))?$/i;
-const SIMPLE_RE = /^\/?(правила|бан|огоньки|серии)[.!\s]*$/i;
+const SIMPLE_RE = /^\/?(правила|команды|бан|огоньки|серии)[.!\s]*$/i;
 const COIN_RE = /^\/?монетка(?:\s+([\s\S]*))?$/i;
 const TOKEN_RE = new RegExp(`^${TARGET_SRC}$`, 'i');
 // Фразы-приглашения: "го агонь", "огонёк" (+ ник до или после), "обнять", "снежок".
@@ -708,6 +708,32 @@ async function handleRulesCommand(message) {
     console.error(`[rules] VK не принял format_data (${e.message}), отправляю без жирного`);
     await sendMessage(message.peer_id, text);
   }
+}
+
+// --- команды ---------------------------------------------------------------
+
+function commandsText() {
+  return [
+    '📋 Команды бота',
+    '',
+    '📜 правила — правила официального комьюнити',
+    '💎 кристаллы — ваш баланс кристаллов. С reply на сообщение или с @ником — баланс другого участника',
+    `   (за каждое ваше сообщение вы получаете ${CRYSTALS_PER_MESSAGE} ${pluralCrystals(CRYSTALS_PER_MESSAGE)})`,
+    '🪙 монетка 100 — бросить монетку на 100 кристаллов: ответьте на сообщение соперника или укажите его @ник. Соперник выбирает «Кидаем» или «Нет», победитель забирает ставку',
+    '🔥 го агонь или огонёк — предложить серию: ответьте на сообщение пользователя или укажите его @ник. Чтобы серия жила, оба должны хотя бы раз в сутки ответить reply друг другу',
+    '📊 серии или огоньки — список серий этого чата',
+    '🤗 обнять — обнять пользователя (reply или @ник)',
+    '❄️ снежок — кинуть в пользователя снежок (reply или @ник)',
+    '',
+    '🛡 Для админов и создателя беседы:',
+    '🔨 бан — исключить участника: ответьте этой командой на его сообщение',
+    '🚫 /запретить слово — добавить слово в список удаляемых сообщений',
+    '✅ /разрешить слово — убрать слово из этого списка',
+  ].join('\n');
+}
+
+async function handleCommandsList(message) {
+  await replyTo(message, commandsText());
 }
 
 // --- /бан -------------------------------------------------------------------
@@ -1228,6 +1254,7 @@ async function handleSocialCommand(cmd, message, token) {
 
 async function handleCommand({ cmd, args }, message) {
   if (cmd === 'правила') return handleRulesCommand(message);
+  if (cmd === 'команды') return handleCommandsList(message);
   if (cmd === 'бан') return handleBanCommand(message);
   if (cmd === 'кристаллы') return handleCrystalsCommand(message, args);
   if (cmd === 'монетка') return handleDuelCommand(message, args);
