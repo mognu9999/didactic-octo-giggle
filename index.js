@@ -8,6 +8,7 @@ const { containsProfanity } = require('./badwords');
 const { containsLgbt } = require('./lgbt');
 const { loadCustomWords, addCustomWord, removeCustomWord, containsCustomWord } = require('./userwords');
 const { checkForbidden, loadBlocklist } = require('./forbidden');
+const { createStore } = require('./streaks');
 
 // ---------------------------------------------------------------------------
 // Настройки
@@ -73,6 +74,10 @@ const CRYSTALS_PER_MESSAGE = Number(process.env.CRYSTALS_PER_MESSAGE) || 1;
 // Слова, добавленные командой /запретить (лежат рядом со статистикой, чтобы
 // один и тот же Volume хранил и то и другое).
 const WORDS_FILE = process.env.WORDS_FILE || path.join(path.dirname(STATS_FILE), 'custom_words.txt');
+
+// Серии (огоньки) тоже лежат рядом со статистикой.
+const STREAKS_FILE = process.env.STREAKS_FILE || path.join(path.dirname(STATS_FILE), 'streaks.json');
+const streaks = createStore();
 
 // В каких единицах VK считает смещения жирного шрифта. По умолчанию — UTF-16
 // (как индексы строк в JS). Если жирное съезжает на 1-2 символа из-за эмодзи,
@@ -543,7 +548,7 @@ async function getUserName(userId) {
 }
 
 // ---------------------------------------------------------------------------
-// Команды: /правила, /бан, /кр, /к, /м, /запретить, /разрешить
+// Команды: правила, бан, кристаллы, монетка, огонёк, серии, обнять, снежок, /запретить, /разрешить
 // ---------------------------------------------------------------------------
 
 function sendMessage(peerId, text, extra = {}) {
@@ -575,13 +580,51 @@ async function replyTo(message, text, extra = {}) {
   }
 }
 
-const COMMAND_RE = /^\/(правила|запретить|разрешить|бан|кр|к|м)(?:@\S+)?(?:\s+([\s\S]*))?$/i;
+// Слова-команды пишутся без слэша ("кристаллы", "монетка 100", "обнять", "серии"...),
+// слэш в начале тоже допустим. Только /запретить и /разрешить — всегда со слэшем.
+// Команда должна занимать ВСЁ сообщение, поэтому обычные фразы со словом "монетка" не срабатывают.
+const TARGET_SRC =
+  '(?:\\[id\\d+\\|[^\\]]*\\]|@[A-Za-z0-9_.]{2,}|(?:https?:\\/\\/)?(?:m\\.)?vk\\.(?:com|ru)\\/[A-Za-z0-9_.]{2,}|[A-Za-z][A-Za-z0-9_.]{2,31})';
+const SLASH_RE = /^\/(запретить|разрешить)(?:@\S+)?(?:\s+([\s\S]*))?$/i;
+const SIMPLE_RE = /^\/?(правила|бан|огоньки|серии)[.!\s]*$/i;
+const COIN_RE = /^\/?монетка(?:\s+([\s\S]*))?$/i;
+const TOKEN_RE = new RegExp(`^${TARGET_SRC}$`, 'i');
+// Фразы-приглашения: "го агонь", "огонёк" (+ ник до или после), "обнять", "снежок".
+const SOCIAL = [
+  { cmd: 'огонек', phrase: 'го\\s+[ао]г[оа]нь|огон[её]к' },
+  { cmd: 'кристаллы', phrase: 'кристаллы' },
+  { cmd: 'обнять', phrase: 'обнять' },
+  { cmd: 'снежок', phrase: 'снежок' },
+].map(({ cmd, phrase }) => ({
+  cmd,
+  re: new RegExp(`^\\/?(?:(${TARGET_SRC})\\s+)?(?:${phrase})(?:\\s+(${TARGET_SRC}))?[.!…\\s]*$`, 'i'),
+}));
 
-// "/м 100 @user" -> { cmd: 'м', args: '100 @user' }
+// "монетка 100 @user": только числа и упоминания, чтобы не ловить обычные фразы.
+function validCoinArgs(args) {
+  if (!args) return true;
+  const tokens = args.replace(/\[id\d+\|[^\]]*\]/g, 'M').trim().split(/\s+/);
+  return tokens.length <= 4 && tokens.every((t) => /^\d{1,12}$/.test(t) || t === 'M' || TOKEN_RE.test(t));
+}
+
+// "/запретить слово" -> { cmd: 'запретить', args: 'слово' }
 function parseCommand(text) {
-  const m = COMMAND_RE.exec(String(text || '').trim());
-  if (!m) return null;
-  return { cmd: m[1].toLowerCase(), args: (m[2] || '').trim() };
+  const t = String(text || '').trim();
+  if (!t || t.length > 300) return null;
+  let m = SLASH_RE.exec(t);
+  if (m) return { cmd: m[1].toLowerCase(), args: (m[2] || '').trim() };
+  m = SIMPLE_RE.exec(t);
+  if (m) return { cmd: m[1].toLowerCase(), args: '' };
+  m = COIN_RE.exec(t);
+  if (m) {
+    const args = (m[1] || '').trim();
+    return validCoinArgs(args) ? { cmd: 'монетка', args } : null;
+  }
+  for (const { cmd, re } of SOCIAL) {
+    m = re.exec(t);
+    if (m) return { cmd, args: (m[1] || m[2] || '').trim() };
+  }
+  return null;
 }
 
 // Сообщение, на которое ответил автор команды (reply или единственное пересланное).
@@ -690,41 +733,73 @@ async function handleBanCommand(message) {
 
 // --- /запретить и /разрешить ------------------------------------------------
 
+// Удаляет только что отправленное ботом сообщение через delayMs.
+// res — ответ messages.send (число message_id или объект/массив с ids).
+function deleteSentLater(peerId, res, delayMs) {
+  const item = Array.isArray(res) ? res[0] : res;
+  let params = null;
+  if (item && typeof item === 'object') {
+    if (item.conversation_message_id) params = { peer_id: peerId, cmids: String(item.conversation_message_id) };
+    else if (item.message_id) params = { message_ids: String(item.message_id) };
+  } else if (typeof item === 'number' && item > 0) {
+    params = { message_ids: String(item) };
+  }
+  if (!params) return;
+  const timer = setTimeout(() => {
+    callApi('messages.delete', { ...params, delete_for_all: 1, group_id: GROUP_ID }).catch((e) =>
+      console.error('[words] не удалось удалить сообщение бота:', e.message)
+    );
+  }, delayMs);
+  if (timer.unref) timer.unref();
+}
+
+const SELF_DELETE_MS = 5000;
+
 async function handleWordCommand(cmd, message, args) {
   if (!(await isChatAdmin(message.peer_id, message.from_id))) return; // только админы и владелец
-  if (!args) {
-    return replyTo(message, `Укажите слово: /${cmd} слово`);
-  }
+  // Любой ответ на эти команды бот сам удаляет через 5 секунд.
+  const say = async (text) => deleteSentLater(message.peer_id, await replyTo(message, text), SELF_DELETE_MS);
+
+  if (!args) return say(`Укажите слово: /${cmd} слово`);
   if (cmd === 'запретить') {
     const r = addCustomWord(args);
     if (r.status === 'added') {
       console.log(`[words] добавлено "${r.word}" (админ ${message.from_id})`);
-      return replyTo(message, `Слово «${r.word}» добавлено в список удаляемых.`);
+      return say(`Слово «${r.word}» добавлено в список удаляемых.`);
     }
-    if (r.status === 'exists') return replyTo(message, `Слово «${r.word}» уже в списке.`);
-    if (r.status === 'too_long') return replyTo(message, 'Слишком длинно (максимум 100 символов).');
-    return replyTo(message, 'Слишком короткое слово: нужно минимум 3 символа.');
+    if (r.status === 'exists') return say(`Слово «${r.word}» уже в списке.`);
+    if (r.status === 'too_long') return say('Слишком длинно (максимум 100 символов).');
+    return say('Слишком короткое слово: нужно минимум 3 символа.');
   }
   const r = removeCustomWord(args);
   if (r.status === 'removed') {
     console.log(`[words] убрано "${r.word}" (админ ${message.from_id})`);
-    return replyTo(message, `Слово «${r.word}» убрано из списка.`);
+    return say(`Слово «${r.word}» убрано из списка.`);
   }
-  return replyTo(message, `Слова «${r.word}» нет в списке, добавленном через /запретить.`);
+  return say(`Слова «${r.word}» нет в списке, добавленном через /запретить.`);
 }
 
-// --- кристаллы: /кр и /к ----------------------------------------------------
+// --- кристаллы ----------------------------------------------------------------
 
-async function handleCrystalsCommand(message) {
-  const rec = getStat(message.peer_id, message.from_id);
-  const name = await getUserName(message.from_id);
-  await sendMessage(message.peer_id, `${name} у вас ${rec.crystals} ${pluralCrystals(rec.crystals)}`);
+function peekCrystals(peerId, userId) {
+  const chat = stats[peerId];
+  return (chat && chat[userId] && chat[userId].crystals) || 0;
 }
 
-// /к — ответ reply-ем на сообщение с командой.
-async function handleShortCrystalsCommand(message) {
-  const rec = getStat(message.peer_id, message.from_id);
-  await replyTo(message, `💎 У вас ${rec.crystals} ${pluralCrystals(rec.crystals)}`);
+// "кристаллы" — свой баланс. С reply или ником/упоминанием — баланс этого пользователя.
+async function handleCrystalsCommand(message, token) {
+  const target = await resolveTarget(message, token);
+  if (target.notFound && target.bare) return; // это просто слово в чате, а не команда
+  if (target.notFound) {
+    return replyTo(message, 'Не нашёл такого пользователя. Проверьте username или ответьте на его сообщение.');
+  }
+  if (!target.id || target.id === message.from_id) {
+    const n = peekCrystals(message.peer_id, message.from_id);
+    return replyTo(message, `💎 У вас ${n} ${pluralCrystals(n)}`);
+  }
+  const names = await getUserNames([target.id]);
+  const n = peekCrystals(message.peer_id, target.id);
+  return replyTo(message, `у ${names.get(target.id)} ${n} ${pluralCrystals(n)}`);
 }
 
 // --- /м: бросок монетки на кристаллы ----------------------------------------
@@ -802,7 +877,7 @@ async function handleDuelCommand(message, args) {
 
   const amount = parsed.amount;
   if (!amount || !Number.isSafeInteger(amount) || amount < 1) {
-    return replyTo(message, 'Укажите ставку в кристаллах, например: /м 100');
+    return replyTo(message, 'Укажите ставку в кристаллах, например: монетка 100');
   }
 
   const mine = getStat(peerId, challengerId).crystals;
@@ -883,6 +958,7 @@ async function handleEvent(ev) {
       payload = null;
     }
   }
+  if (payload && payload.fire) return handleFireEvent(ev, payload, answer);
   if (!payload || !payload.duel) return answer();
 
   pruneDuels();
@@ -906,12 +982,257 @@ async function handleEvent(ev) {
   return answer();
 }
 
+// --- общие помощники для новых команд ---------------------------------------
+
+// Имена по id одним запросом (с кэшем): Map(id -> "Имя Фамилия").
+async function getUserNames(ids) {
+  const out = new Map();
+  const missing = [];
+  for (const id of new Set(ids)) {
+    if (nameCache.has(id)) out.set(id, nameCache.get(id));
+    else missing.push(id);
+  }
+  for (let i = 0; i < missing.length; i += 200) {
+    const chunk = missing.slice(i, i + 200);
+    try {
+      const res = await callApi('users.get', { user_ids: chunk.join(',') });
+      for (const u of Array.isArray(res) ? res : []) {
+        const name = `${u.first_name || ''} ${u.last_name || ''}`.trim();
+        if (name) {
+          nameCache.set(u.id, name);
+          out.set(u.id, name);
+        }
+      }
+    } catch (e) {
+      console.error('Не удалось получить имена пользователей:', e.message);
+    }
+  }
+  for (const id of ids) if (!out.has(id)) out.set(id, `id${id}`);
+  return out;
+}
+
+// Кого имел в виду автор: reply на сообщение > упоминание [id1|..] > @username / ссылка / ник.
+async function resolveTarget(message, token) {
+  const t = replyTarget(message);
+  if (t && t.from_id > 0) return { id: t.from_id };
+  if (!token) return { id: null, none: true };
+  const mention = /^\[id(\d+)\|/.exec(token);
+  if (mention) return { id: Number(mention[1]) };
+  const bare = !/^(@|https?:|m\.|vk\.)/i.test(token);
+  const screen = token.replace(/^@/, '').replace(/^(?:https?:\/\/)?(?:m\.)?vk\.(?:com|ru)\//i, '');
+  try {
+    const res = await callApi('users.get', { user_ids: screen });
+    if (Array.isArray(res) && res[0] && res[0].id) return { id: res[0].id };
+  } catch (e) {
+    /* не нашли */
+  }
+  return { id: null, notFound: true, bare };
+}
+
+// Длинные списки режем на несколько сообщений (лимит VK — 4096 символов).
+async function sendChunks(peerId, header, lines) {
+  let chunk = header;
+  for (const line of lines) {
+    if (chunk.length + line.length + 1 > 3500) {
+      await sendMessage(peerId, chunk);
+      chunk = '';
+    }
+    chunk += (chunk ? '\n' : '') + line;
+  }
+  if (chunk) await sendMessage(peerId, chunk);
+}
+
+async function streakLines(list) {
+  const ids = list.flatMap((s) => [s.a, s.b]);
+  const names = await getUserNames(ids);
+  return list.map((s) => `${names.get(s.a)} и ${names.get(s.b)} 🔥${s.days}`);
+}
+
+// --- картинки для /обнять и /снежок -----------------------------------------
+// VK не принимает SVG как фото, поэтому рядом с .svg лежит готовый .png
+// (картинка одна и та же для всех, её не нужно генерировать на лету).
+// PNG загружается в VK один раз, дальше переиспользуется.
+
+const ASSETS_DIR = path.join(__dirname, 'assets');
+const pictureCache = new Map(); // kind -> "photo-123_456_key"
+
+async function realUploadPicture(kind, peerId) {
+  if (typeof fetch !== 'function' || typeof FormData === 'undefined' || typeof Blob === 'undefined') {
+    throw new Error('нужен Node.js 18 или новее');
+  }
+  const buf = fs.readFileSync(path.join(ASSETS_DIR, `${kind}.png`));
+  const server = await callApi('photos.getMessagesUploadServer', { peer_id: peerId });
+  const form = new FormData();
+  form.append('photo', new Blob([buf], { type: 'image/png' }), `${kind}.png`);
+  const resp = await fetch(server.upload_url, { method: 'POST', body: form });
+  const up = await resp.json();
+  const saved = await callApi('photos.saveMessagesPhoto', { photo: up.photo, server: up.server, hash: up.hash });
+  const p = Array.isArray(saved) ? saved[0] : null;
+  if (!p) throw new Error('VK не сохранил фото');
+  return `photo${p.owner_id}_${p.id}${p.access_key ? `_${p.access_key}` : ''}`;
+}
+let uploadPicture = realUploadPicture;
+
+// Отправляет текст с картинкой. Если картинку загрузить не удалось
+// (например, у ключа нет права на фото) — отправляет просто текст.
+async function sendWithPicture(message, text, kind, extra = {}) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let attachment = pictureCache.get(kind);
+    if (!attachment) {
+      try {
+        attachment = await uploadPicture(kind, message.peer_id);
+        pictureCache.set(kind, attachment);
+      } catch (e) {
+        console.error(
+          `[picture] не удалось загрузить картинку ${kind}: ${e.message}. ` +
+            'Проверьте, что у ключа сообщества включено право на «Фотографии».'
+        );
+        break;
+      }
+    }
+    try {
+      return await replyTo(message, text, { ...extra, attachment });
+    } catch (e) {
+      if (e.vkCode === undefined) throw e;
+      pictureCache.delete(kind); // вдруг вложение устарело — загрузим заново
+      console.error(`[picture] VK не принял вложение ${kind}: ${e.message}`);
+    }
+  }
+  return replyTo(message, text, extra);
+}
+
+// --- огонёк (серии) ---------------------------------------------------------
+
+async function handleFireInvite(message, targetId) {
+  const peerId = message.peer_id;
+  const fromId = message.from_id;
+  const r = streaks.createInvite(peerId, fromId, targetId);
+  const names = await getUserNames([fromId, targetId]);
+  if (r.status === 'exists') {
+    return replyTo(message, `У вас уже есть серия с ${names.get(targetId)} 🔥${r.streak.days}`);
+  }
+  if (r.status === 'pending') {
+    return replyTo(message, `Предложение для ${names.get(targetId)} уже отправлено. Ждём ответа 🔥`);
+  }
+  const id = r.invite.id;
+  const keyboard = {
+    inline: true,
+    buttons: [
+      [
+        { action: { type: 'callback', label: 'Принять', payload: JSON.stringify({ fire: id, act: 'ok' }) }, color: 'positive' },
+        { action: { type: 'callback', label: 'Отказаться', payload: JSON.stringify({ fire: id, act: 'no' }) }, color: 'negative' },
+      ],
+    ],
+  };
+  await replyTo(
+    message,
+    `[id${targetId}|${names.get(targetId)}] вааау😻, ${names.get(fromId)} предлагает вам растить серию🥰`,
+    { keyboard, disable_mentions: 0 }
+  );
+}
+
+async function handleFireEvent(ev, payload, answer) {
+  const inv = streaks.getInvite(payload.fire);
+  if (!inv || inv.peerId !== ev.peer_id) return answer('Это предложение уже недействительно');
+  if (ev.user_id !== inv.to) return answer('Это предложение адресовано не вам');
+
+  if (payload.act === 'no') {
+    streaks.removeInvite(inv.id);
+    await answer();
+    const names = await getUserNames([inv.from]);
+    await sendMessage(inv.peerId, `[id${inv.from}|${names.get(inv.from)}], эх, извините пользователь не хочет общ с вами`, {
+      disable_mentions: 0,
+    });
+    return;
+  }
+  if (payload.act === 'ok') {
+    const s = streaks.accept(inv.id);
+    await answer();
+    if (!s) return;
+    const names = await getUserNames([s.a, s.b]);
+    await sendMessage(s.peerId, `одяяяя, ${names.get(s.a)} и ${names.get(s.b)} запускают серию!🔥`);
+    return;
+  }
+  return answer();
+}
+
+async function handleStreaksList(message) {
+  const list = streaks.listStreaks(message.peer_id);
+  if (!list.length) {
+    return replyTo(
+      message,
+      'В этом чате пока нет серий. Ответьте на сообщение пользователя словами «го агонь» или «огонёк», чтобы предложить ему серию 🔥'
+    );
+  }
+  await sendChunks(message.peer_id, 'Серии чата:', await streakLines(list));
+}
+
+// Вызывается раз в 30 секунд: полночь, напоминания, завершение серий.
+async function runStreakTick(now = Date.now()) {
+  let events;
+  try {
+    events = streaks.tick(now);
+  } catch (e) {
+    console.error('Ошибка планировщика серий:', e);
+    return;
+  }
+  for (const ev of events) {
+    try {
+      if (ev.type === 'ended') {
+        const s = ev.streak;
+        const names = await getUserNames([s.a, s.b]);
+        await sendMessage(
+          s.peerId,
+          `${names.get(s.a)} и ${names.get(s.b)} к сожалению ваша серия завершена, восстановить её никак не удастся, только начать заново.`
+        );
+      } else if (ev.type === 'fading') {
+        const header =
+          ev.kind === 'midnight'
+            ? 'Серии чата угасают.. Не оставьте общение во тьме..'
+            : 'Серии чата нужно обновить! Ответьте (reply) друг другу, чтобы огонёк не погас:';
+        await sendChunks(ev.peerId, header, await streakLines(ev.streaks));
+      }
+    } catch (e) {
+      console.error('[streaks] не удалось отправить сообщение в беседу:', e.message);
+    }
+  }
+}
+
+// --- /обнять и /снежок ------------------------------------------------------
+
+const SOCIAL_HINTS = {
+  огонек: 'Ответьте на сообщение пользователя или укажите его username, чтобы предложить ему огонёк 🔥',
+  обнять: 'Ответьте на сообщение пользователя или укажите его username, чтобы обнять его 🤗',
+  снежок: 'Ответьте на сообщение пользователя или укажите его username, чтобы кинуть в него снежок ❄️',
+};
+
+async function handleSocialCommand(cmd, message, token) {
+  const target = await resolveTarget(message, token);
+  if (!target.id) {
+    if (target.notFound && target.bare) return; // это просто слово в чате, а не команда
+    if (target.notFound) return replyTo(message, 'Не нашёл такого пользователя. Проверьте username или ответьте на его сообщение.');
+    return replyTo(message, SOCIAL_HINTS[cmd]);
+  }
+  if (target.id === message.from_id) return replyTo(message, 'Выберите другого пользователя 🙂');
+
+  if (cmd === 'огонек') return handleFireInvite(message, target.id);
+
+  const names = await getUserNames([message.from_id, target.id]);
+  const who = names.get(message.from_id);
+  const whom = `[id${target.id}|${names.get(target.id)}]`;
+  if (cmd === 'обнять') {
+    return sendWithPicture(message, `${who} обнимает ${whom}`, 'hug', { disable_mentions: 0 });
+  }
+  return sendWithPicture(message, `${who} кидает снежок в ${whom}`, 'snowball', { disable_mentions: 0 });
+}
+
 async function handleCommand({ cmd, args }, message) {
   if (cmd === 'правила') return handleRulesCommand(message);
   if (cmd === 'бан') return handleBanCommand(message);
-  if (cmd === 'кр') return handleCrystalsCommand(message);
-  if (cmd === 'к') return handleShortCrystalsCommand(message);
-  if (cmd === 'м') return handleDuelCommand(message, args);
+  if (cmd === 'кристаллы') return handleCrystalsCommand(message, args);
+  if (cmd === 'монетка') return handleDuelCommand(message, args);
+  if (cmd === 'огоньки' || cmd === 'серии') return handleStreaksList(message);
+  if (cmd === 'огонек' || cmd === 'обнять' || cmd === 'снежок') return handleSocialCommand(cmd, message, args);
   if (cmd === 'запретить' || cmd === 'разрешить') return handleWordCommand(cmd, message, args);
 }
 
@@ -943,22 +1264,25 @@ async function handleMessage(message, edited = false) {
 
   if (!(message.from_id > 0)) return; // сообщества/боты
 
-  // Команды: /правила, /бан, /кр, /к, /м, /запретить, /разрешить.
-  // Команда без аргументов обрабатывается сразу. Команда с аргументами сначала
-  // проходит обычную проверку текста (иначе через неё можно было бы протащить
+  // Команды (см. parseCommand). Команда без аргументов выполняется сразу.
+  // Команда с аргументами, вложениями или пересланными сообщениями сначала
+  // проходит обычную проверку (иначе через неё можно было бы протащить
   // запрещённое). Исключение — /запретить и /разрешить от админов: слово,
   // которое они вносят в список, не должно считаться нарушением.
   const parsed = edited ? null : parseCommand(message.text);
-  if (parsed) {
+  const hasExtras =
+    (message.attachments && message.attachments.length > 0) ||
+    (message.fwd_messages && message.fwd_messages.length > 0);
+  let skipCheck = false;
+  if (parsed && !hasExtras) {
     const adminWordCmd = parsed.cmd === 'запретить' || parsed.cmd === 'разрешить';
-    if (!parsed.args || (adminWordCmd && (await isChatAdmin(peerId, message.from_id)))) {
-      return handleCommand(parsed, message);
-    }
+    if (!parsed.args) skipCheck = true;
+    else if (adminWordCmd && (await isChatAdmin(peerId, message.from_id))) skipCheck = true;
   }
 
   // Горячий путь: проверка — это только регулярки, без сетевых запросов,
   // а удаление — один запрос к VK.
-  let reason = inspectMessage(message);
+  let reason = skipCheck ? null : inspectMessage(message);
 
   // Репост из сообщества от админа/владельца беседы — не трогаем (остальные
   // проверки текста для него всё равно действуют).
@@ -973,10 +1297,16 @@ async function handleMessage(message, edited = false) {
   }
   if (reason) return removeMessage(message, reason);
 
-  // Команда с аргументами, прошедшая проверку, — выполняем (кристаллы за неё не дают).
+  // Сообщение прошло проверку. Reply на сообщение другого участника
+  // поддерживает серию (огонёк) между ними, если она есть.
+  if (!edited && message.reply_message) {
+    streaks.recordReply(peerId, message.from_id, message.reply_message.from_id);
+  }
+
+  // Команда — выполняем (кристаллы за неё не дают).
   if (parsed) return handleCommand(parsed, message);
 
-  // Сообщение прошло проверку — начисляем кристаллы (правки не считаются).
+  // Обычное сообщение — начисляем кристаллы (правки не считаются).
   if (!edited) addCrystals(peerId, message.from_id);
 }
 
@@ -1060,7 +1390,14 @@ async function start() {
   console.log(`Слова из /запретить (${WORDS_FILE}): ${nWords}`);
   loadStats(STATS_FILE);
   persistStats = true;
-  const flush = () => saveStatsNow();
+  const nStreaks = streaks.load(STREAKS_FILE);
+  streaks.setPersist(true);
+  console.log(`Серии (${STREAKS_FILE}): ${nStreaks}`);
+  setInterval(() => runStreakTick(), 30 * 1000);
+  const flush = () => {
+    saveStatsNow();
+    streaks.flush();
+  };
   process.on('SIGTERM', () => {
     flush();
     process.exit(0);
@@ -1102,6 +1439,13 @@ module.exports = {
   getStat,
   loadCustomWordsForTests: loadCustomWords,
   pluralCrystals,
+  deleteSentLater,
+  streaks,
+  runStreakTick,
+  getUserNames,
+  _setUploader: (fn) => {
+    uploadPicture = fn;
+  },
   _config: () => ({ TOKEN, GROUP_ID }),
   _setApi: (fn) => {
     callApi = fn;
