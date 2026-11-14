@@ -9,6 +9,10 @@ const { containsLgbt } = require('./lgbt');
 const { loadCustomWords, addCustomWord, removeCustomWord, containsCustomWord } = require('./userwords');
 const { checkForbidden, loadBlocklist } = require('./forbidden');
 const { createStore } = require('./streaks');
+const aiLib = require('./ai');
+const { buildGraph, GraphError } = require('./graph');
+const { getWeather } = require('./weather');
+const render = require('./render');
 
 // ---------------------------------------------------------------------------
 // Настройки
@@ -24,7 +28,7 @@ const TOKEN =
   process.env.API_TOKEN ||
   process.env.TOKEN;
 // ID сообщества указывать необязательно: если не задан, бот узнает его сам по токену.
-let GROUP_ID = Math.abs(Number(process.env.VK_GROUP_ID)) || 0;
+let GROUP_ID = Math.abs(Number(process.env.VK_GROUP_ID || process.env.GROUP_ID)) || 0;
 const API_VERSION = '5.199';
 const CHAT_PEER_START = 2000000000; // peer_id беседы всегда больше этого числа
 
@@ -78,6 +82,9 @@ const WORDS_FILE = process.env.WORDS_FILE || path.join(path.dirname(STATS_FILE),
 // Серии (огоньки) тоже лежат рядом со статистикой.
 const STREAKS_FILE = process.env.STREAKS_FILE || path.join(path.dirname(STATS_FILE), 'streaks.json');
 const streaks = createStore();
+
+// Нейросети (ключи берутся из переменных окружения, см. ai.js).
+const aiClient = aiLib.createAi(process.env);
 
 // В каких единицах VK считает смещения жирного шрифта. По умолчанию — UTF-16
 // (как индексы строк в JS). Если жирное съезжает на 1-2 символа из-за эмодзи,
@@ -585,10 +592,19 @@ async function replyTo(message, text, extra = {}) {
 // Команда должна занимать ВСЁ сообщение, поэтому обычные фразы со словом "монетка" не срабатывают.
 const TARGET_SRC =
   '(?:\\[id\\d+\\|[^\\]]*\\]|@[A-Za-z0-9_.]{2,}|(?:https?:\\/\\/)?(?:m\\.)?vk\\.(?:com|ru)\\/[A-Za-z0-9_.]{2,}|[A-Za-z][A-Za-z0-9_.]{2,31})';
-const SLASH_RE = /^\/(запретить|разрешить)(?:@\S+)?(?:\s+([\s\S]*))?$/i;
+const SLASH_RE = /^\/(запретить|разрешить|ии)(?:@\S+)?(?:\s+([\s\S]*))?$/i;
 const SIMPLE_RE = /^\/?(правила|команды|бан|огоньки|серии)[.!\s]*$/i;
 const COIN_RE = /^\/?монетка(?:\s+([\s\S]*))?$/i;
 const TOKEN_RE = new RegExp(`^${TARGET_SRC}$`, 'i');
+// "даровать 50" + reply, или с ником до/после.
+const GIFT_RE = new RegExp(`^\\/?(?:(${TARGET_SRC})\\s+)?даровать(?:\\s+([\\s\\S]*))?$`, 'i');
+// "погода Москва", "погода в Санкт-Петербурге".
+const WEATHER_RE = /^\/?погода(?:\s+(?:в|во|для)\s+|\s+)(\S[\s\S]{1,58})$/i;
+const PLACE_RE = /^[\p{L}\d][\p{L}\d\s.,'\-]{1,59}$/u;
+// "график y = x^2", "построй график sin(x); cos(x) от -5 до 5".
+const GRAPH_RE = /^\/?(?:(?:построй|нарисуй|покажи|сделай)\s+)?(?:график[и]?|plot)\s+(?:функци[июй]\s+)?([\s\S]{1,200})$/i;
+// "нарисуй кота" (только когда обращаются к Катёнку).
+const DRAW_RE = /^(?:нарисуй|нарисуйте|изобрази|сгенерируй(?:\s+(?:svg|картинку|изображение|рисунок))?|создай\s+(?:svg|картинку|изображение|рисунок)|svg)[\s:,\-]+([\s\S]{3,400})$/i;
 // Фразы-приглашения: "го агонь", "огонёк" (+ ник до или после), "обнять", "снежок".
 const SOCIAL = [
   { cmd: 'огонек', phrase: 'го\\s+[ао]г[оа]нь|огон[её]к' },
@@ -620,6 +636,15 @@ function parseCommand(text) {
     const args = (m[1] || '').trim();
     return validCoinArgs(args) ? { cmd: 'монетка', args } : null;
   }
+  m = GIFT_RE.exec(t);
+  if (m) {
+    const args = `${m[1] || ''} ${m[2] || ''}`.trim();
+    return validCoinArgs(args) ? { cmd: 'даровать', args } : null;
+  }
+  m = WEATHER_RE.exec(t);
+  if (m && PLACE_RE.test(m[1].trim()) && m[1].trim().split(/\s+/).length <= 4) return { cmd: 'погода', args: m[1].trim() };
+  m = GRAPH_RE.exec(t);
+  if (m) return { cmd: 'график', args: m[1].trim() };
   for (const { cmd, re } of SOCIAL) {
     m = re.exec(t);
     if (m) return { cmd, args: (m[1] || m[2] || '').trim() };
@@ -724,11 +749,16 @@ function commandsText() {
     '📊 серии или огоньки — список серий этого чата',
     '🤗 обнять — обнять пользователя (reply или @ник)',
     '❄️ снежок — кинуть в пользователя снежок (reply или @ник)',
+    '🎁 даровать 50 — подарить кристаллы: ответьте на сообщение участника или укажите его @ник',
+    '🌦 погода Москва — погода в любом населённом пункте',
+    '📈 график y = x^2 — график функции; можно несколько через «;» и диапазон: график sin(x); cos(x) от -6 до 6',
+    '🐱 Катёнак, <вопрос> — нейросеть: ответит на вопрос, решит задачу. «Катёнак, нарисуй кота» — нарисует SVG-картинку',
     '',
     '🛡 Для админов и создателя беседы:',
     '🔨 бан — исключить участника: ответьте этой командой на его сообщение',
     '🚫 /запретить слово — добавить слово в список удаляемых сообщений',
     '✅ /разрешить слово — убрать слово из этого списка',
+    '🤖 /ии — проверить, какие нейросети подключены и работают',
   ].join('\n');
 }
 
@@ -1083,19 +1113,8 @@ const ASSETS_DIR = path.join(__dirname, 'assets');
 const pictureCache = new Map(); // kind -> "photo-123_456_key"
 
 async function realUploadPicture(kind, peerId) {
-  if (typeof fetch !== 'function' || typeof FormData === 'undefined' || typeof Blob === 'undefined') {
-    throw new Error('нужен Node.js 18 или новее');
-  }
   const buf = fs.readFileSync(path.join(ASSETS_DIR, `${kind}.png`));
-  const server = await callApi('photos.getMessagesUploadServer', { peer_id: peerId });
-  const form = new FormData();
-  form.append('photo', new Blob([buf], { type: 'image/png' }), `${kind}.png`);
-  const resp = await fetch(server.upload_url, { method: 'POST', body: form });
-  const up = await resp.json();
-  const saved = await callApi('photos.saveMessagesPhoto', { photo: up.photo, server: up.server, hash: up.hash });
-  const p = Array.isArray(saved) ? saved[0] : null;
-  if (!p) throw new Error('VK не сохранил фото');
-  return `photo${p.owner_id}_${p.id}${p.access_key ? `_${p.access_key}` : ''}`;
+  return uploadPhotoBuffer(buf, `${kind}.png`, peerId);
 }
 let uploadPicture = realUploadPicture;
 
@@ -1252,12 +1271,379 @@ async function handleSocialCommand(cmd, message, token) {
   return sendWithPicture(message, `${who} кидает снежок в ${whom}`, 'snowball', { disable_mentions: 0 });
 }
 
+// ===========================================================================
+// Подарки, погода, графики, рисование и нейросеть «Катёнак»
+// ===========================================================================
+
+const IGNORED = Symbol('ignored'); // обработчик решил, что это не команда, а обычное сообщение
+
+// Подменяемые зависимости (в автотестах заменяются заглушками).
+const deps = {
+  ai: aiClient,
+  getWeather,
+  uploadPhoto: (buf, name, peerId) => uploadPhotoBuffer(buf, name, peerId),
+  uploadDoc: (buf, name, peerId) => uploadDocBuffer(buf, name, peerId),
+};
+
+// --- загрузка файлов в VK ---------------------------------------------------
+
+function needFetch() {
+  if (typeof fetch !== 'function' || typeof FormData === 'undefined' || typeof Blob === 'undefined') {
+    throw new Error('нужен Node.js 18 или новее');
+  }
+}
+
+async function uploadPhotoBuffer(buf, filename, peerId) {
+  needFetch();
+  const server = await callApi('photos.getMessagesUploadServer', { peer_id: peerId });
+  const form = new FormData();
+  form.append('photo', new Blob([buf], { type: 'image/png' }), filename);
+  const up = await (await fetch(server.upload_url, { method: 'POST', body: form })).json();
+  const saved = await callApi('photos.saveMessagesPhoto', { photo: up.photo, server: up.server, hash: up.hash });
+  const p = Array.isArray(saved) ? saved[0] : null;
+  if (!p) throw new Error('VK не сохранил фото');
+  return `photo${p.owner_id}_${p.id}${p.access_key ? `_${p.access_key}` : ''}`;
+}
+
+async function uploadDocBuffer(buf, filename, peerId) {
+  needFetch();
+  const server = await callApi('docs.getMessagesUploadServer', { type: 'doc', peer_id: peerId });
+  const form = new FormData();
+  form.append('file', new Blob([buf], { type: 'image/svg+xml' }), filename);
+  const up = await (await fetch(server.upload_url, { method: 'POST', body: form })).json();
+  const saved = await callApi('docs.save', { file: up.file, title: filename });
+  const d = saved && (saved.doc || saved);
+  if (!d || !d.id) throw new Error('VK не сохранил документ');
+  return `doc${d.owner_id}_${d.id}${d.access_key ? `_${d.access_key}` : ''}`;
+}
+
+// --- отправка текста с жирным названием компании ----------------------------
+
+const aiReplies = new Map(); // "peerId:начало текста" -> время (чтобы понимать, что reply адресован Катёнку)
+const textKey = (peerId, text) => `${peerId}:${String(text || '').replace(/\s+/g, ' ').trim().slice(0, 50)}`;
+
+function rememberAiReply(peerId, text) {
+  aiReplies.set(textKey(peerId, text), Date.now());
+  if (aiReplies.size > 600) {
+    const oldest = [...aiReplies.entries()].sort((a, b) => a[1] - b[1]).slice(0, 200);
+    for (const [k] of oldest) aiReplies.delete(k);
+  }
+}
+
+// Длинный текст режется на несколько сообщений; в каждом название компании — жирным.
+async function sendAiText(message, text) {
+  const parts = aiLib.splitMessage(text, 3800);
+  let first;
+  for (let i = 0; i < parts.length; i++) {
+    const format = buildBoldFormat(parts[i]);
+    const send = (extra) => (i === 0 ? replyTo(message, parts[i], extra) : sendMessage(message.peer_id, parts[i], extra));
+    let res;
+    try {
+      res = await send(format ? { format_data: format } : {});
+    } catch (e) {
+      if (e.vkCode === undefined || !format) throw e;
+      console.error(`[ai] VK не принял format_data (${e.message}), отправляю без жирного`);
+      res = await send({});
+    }
+    rememberAiReply(message.peer_id, parts[i]);
+    if (i === 0) first = res;
+  }
+  return first;
+}
+
+// --- лимиты, память, "печатает..." ------------------------------------------
+
+const aiHits = new Map(); // "kind:userId" -> [время...]
+const aiWarned = new Map();
+const AI_LIMITS = { chat: [12, 5 * 60 * 1000], draw: [4, 10 * 60 * 1000] };
+
+function aiAllowed(userId, kind) {
+  const [max, windowMs] = AI_LIMITS[kind];
+  const key = `${kind}:${userId}`;
+  const now = Date.now();
+  const hits = (aiHits.get(key) || []).filter((t) => now - t < windowMs);
+  if (hits.length >= max) {
+    aiHits.set(key, hits);
+    return false;
+  }
+  hits.push(now);
+  aiHits.set(key, hits);
+  return true;
+}
+
+async function rateLimited(message) {
+  const now = Date.now();
+  if (now - (aiWarned.get(message.from_id) || 0) < 60 * 1000) return;
+  aiWarned.set(message.from_id, now);
+  await replyTo(message, 'Слишком много запросов подряд 😿 Подождите немного и спросите снова.');
+}
+
+const aiHistory = new Map(); // "peerId:userId" -> { at, items }
+const HISTORY_TTL_MS = 30 * 60 * 1000;
+
+function getHistory(key) {
+  const h = aiHistory.get(key);
+  return h && Date.now() - h.at < HISTORY_TTL_MS ? h.items : [];
+}
+function pushHistory(key, user, assistant) {
+  const items = [...getHistory(key), { role: 'user', content: user.slice(0, 1500) }, { role: 'assistant', content: assistant.slice(0, 1500) }].slice(-8);
+  aiHistory.set(key, { at: Date.now(), items });
+  if (aiHistory.size > 2000) {
+    for (const [k, v] of aiHistory) if (Date.now() - v.at > HISTORY_TTL_MS) aiHistory.delete(k);
+  }
+}
+
+function typing(peerId) {
+  callApi('messages.setActivity', { type: 'typing', peer_id: peerId, group_id: GROUP_ID }).catch(() => {});
+}
+
+const NO_AI_TEXT = 'Я пока без нейросетевых мозгов 😿 Администратору нужно добавить API-ключи нейросетей.';
+
+// --- обращение к Катёнку ----------------------------------------------------
+
+const NAME_START_RE = /^\s*(?:(?:привет|эй|хей|слушай|алло|ало|ну|а|так|здарова|здравствуй|добрый\s+день|доброе\s+утро|добрый\s+вечер)[\s,!.-]+)?кат[её]н[ао]к(?![\p{L}])[\s,:!.\-–—?]*/iu;
+const NAME_END_RE = /[\s,]+кат[её]н[ао]к[\s!?.]*$/iu;
+
+// -> { text } если сообщение адресовано Катёнку (по имени, упоминанию сообщества или reply на её ответ)
+function detectAiRequest(message) {
+  let text = String(message.text || '').trim();
+  if (!text) return null;
+  let addressed = false;
+
+  if (GROUP_ID) {
+    const mention = new RegExp(`\\[(?:club|public)${GROUP_ID}\\|[^\\]]*\\]`, 'gi');
+    if (mention.test(text)) {
+      text = text.replace(new RegExp(`\\[(?:club|public)${GROUP_ID}\\|[^\\]]*\\]`, 'gi'), ' ').replace(/^[\s,:]+/, '').trim();
+      addressed = true;
+    }
+  }
+  let m = NAME_START_RE.exec(text);
+  if (m) {
+    text = text.slice(m[0].length).trim();
+    addressed = true;
+  } else if ((m = NAME_END_RE.exec(text)) && text.length > m[0].length) {
+    text = text.slice(0, m.index).trim();
+    addressed = true;
+  }
+  const rm = message.reply_message;
+  if (!addressed && rm && rm.from_id === -GROUP_ID && aiReplies.has(textKey(message.peer_id, rm.text))) addressed = true;
+  return addressed ? { text } : null;
+}
+
+const WEATHER_NL_RE = /погод\w*\s+(?:сейчас\s+|сегодня\s+|завтра\s+)?(?:в|во|для)\s+([\p{L}][\p{L}\s.\-]{1,40}?)\s*[?!.]*$/iu;
+
+async function handleAiRequest(message, req) {
+  const text = req.text;
+  if (!text) {
+    return replyTo(message, 'Слушаю 🐱 Напишите вопрос после моего имени, например: «Катёнак, как решить x² − 5x + 6 = 0?»');
+  }
+
+  // 1) Вопросы о личности — готовые ответы, без нейросети.
+  const kind = aiLib.identityIntent(text);
+  if (kind) return sendAiText(message, aiLib.cannedAnswer(kind));
+
+  // 2) Команды, сказанные Катёнку: "Катёнак, погода Москва", "Катёнак, график sin(x)".
+  const w = WEATHER_RE.exec(text) || WEATHER_NL_RE.exec(text);
+  if (w) return handleWeatherCommand(message, w[1].trim(), true);
+  const g = GRAPH_RE.exec(text);
+  if (g) return handleGraphCommand(message, g[1].trim(), true);
+  const d = DRAW_RE.exec(text);
+  if (d) return handleDrawCommand(message, d[1].trim());
+
+  // 3) Обычный разговор / задачи.
+  return handleAiChat(message, text);
+}
+
+function aiOutputBlocked(text) {
+  return containsLgbt(text) || Boolean(checkForbidden(text));
+}
+
+async function handleAiChat(message, text) {
+  if (!deps.ai.available()) return replyTo(message, NO_AI_TEXT);
+  if (!aiAllowed(message.from_id, 'chat')) return rateLimited(message);
+  typing(message.peer_id);
+
+  const key = `${message.peer_id}:${message.from_id}`;
+  const quoted = message.reply_message && message.reply_message.text ? String(message.reply_message.text).slice(0, 800) : '';
+  const userContent = quoted ? `[Сообщение, на которое ответил пользователь: «${quoted}»]\n\n${text}` : text;
+  const messages = [
+    { role: 'system', content: aiLib.systemPrompt(new Date()) },
+    ...getHistory(key),
+    { role: 'user', content: userContent },
+  ];
+
+  let result;
+  try {
+    result = await deps.ai.chat({ messages, maxTokens: 1100, temperature: 0.5 });
+  } catch (e) {
+    console.error('[ai] ошибка:', e.message);
+    return replyTo(message, 'Не получилось ответить: нейросети сейчас перегружены 😿 Попробуйте ещё раз чуть позже.');
+  }
+
+  let { text: out } = aiLib.postprocess(result.text);
+  if (!out) return replyTo(message, 'Не смогла сформулировать ответ 😿 Попробуйте переписать вопрос.');
+  if (aiOutputBlocked(out)) out = 'Это не получится обсудить в рамках правил официального сообщества 🐱';
+  pushHistory(key, text, out);
+  console.log(`[ai] peer=${message.peer_id} user=${message.from_id} ${result.provider}/${result.model}`);
+  return sendAiText(message, out);
+}
+
+// --- картинки: рисунки и графики --------------------------------------------
+
+// Отправляет SVG: как PNG-фото (его видно сразу) и, если withSvgFile, ещё и как файл .svg.
+async function sendImageResult(message, svg, caption, name, withSvgFile) {
+  const peerId = message.peer_id;
+  const attachments = [];
+  let pngError = null;
+  if (render.available()) {
+    try {
+      attachments.push(await deps.uploadPhoto(render.svgToPng(svg, 1200), `${name}.png`, peerId));
+    } catch (e) {
+      pngError = e;
+      console.error(`[image] не удалось отправить PNG: ${e.message}. Проверьте право «Фотографии» у ключа сообщества.`);
+    }
+  } else {
+    console.error('[image] пакет @resvg/resvg-js не установлен: добавьте его в package.json (npm install @resvg/resvg-js)');
+  }
+  if (withSvgFile || !attachments.length) {
+    try {
+      attachments.push(await deps.uploadDoc(Buffer.from(svg, 'utf8'), `${name}.svg`, peerId));
+    } catch (e) {
+      console.error(`[image] не удалось отправить SVG-файл: ${e.message}. Проверьте право «Документы» у ключа сообщества.`);
+    }
+  }
+  if (!attachments.length) {
+    return replyTo(message, 'Картинка готова, но я не смогла её отправить 😿 Администратору нужно проверить права ключа (фото и документы) и установить @resvg/resvg-js.');
+  }
+  return replyTo(message, caption, { attachment: attachments.join(',') });
+}
+
+async function handleGraphCommand(message, args, addressed) {
+  let g;
+  try {
+    g = buildGraph(args);
+  } catch (e) {
+    const mathy = /x|\d|\^|sin|cos|tan|sqrt|ln\(/i.test(args);
+    if (!addressed && !mathy) return IGNORED; // например, "график работы" — обычная фраза
+    const why = e instanceof GraphError ? e.message : 'не смогла разобрать выражение';
+    return replyTo(
+      message,
+      `Не получилось построить график: ${why}.\nПримеры: график y = x^2 - 4 · график sin(x); cos(x) от -6 до 6 · график 1/x от -5 до 5`
+    );
+  }
+  typing(message.peer_id);
+  const caption = `📈 График: ${g.exprs.map((e) => `y = ${e}`).join(';  ')}`;
+  return sendImageResult(message, g.svg, caption, 'graph', false);
+}
+
+async function handleDrawCommand(message, prompt) {
+  if (!deps.ai.available()) return replyTo(message, NO_AI_TEXT);
+  if (!aiAllowed(message.from_id, 'draw')) return rateLimited(message);
+  typing(message.peer_id);
+
+  let svg = null;
+  for (let attempt = 0; attempt < 2 && !svg; attempt++) {
+    try {
+      const r = await deps.ai.chat({
+        messages: [
+          { role: 'system', content: aiLib.SVG_SYSTEM_PROMPT },
+          { role: 'user', content: `Нарисуй: ${prompt}` },
+        ],
+        maxTokens: 4500, temperature: 0.8, timeoutMs: 70000, maxProviders: 3,
+      });
+      if (/^\s*ОТКАЗ/i.test(r.text)) return replyTo(message, 'Такое я нарисовать не могу в рамках правил сообщества 🐱');
+      const candidate = render.sanitizeSvg(render.extractSvg(r.text));
+      if (!candidate) continue;
+      if (render.available()) render.svgToPng(candidate, 200); // проверка, что SVG корректный
+      svg = candidate;
+    } catch (e) {
+      console.error('[draw] попытка не удалась:', e.message);
+    }
+  }
+  if (!svg) return replyTo(message, 'Не получилось нарисовать это 😿 Попробуйте описать проще или иначе.');
+  const short = prompt.length > 80 ? `${prompt.slice(0, 79)}…` : prompt;
+  return sendImageResult(message, svg, `🎨 Готово: «${short}»`, 'drawing', true);
+}
+
+// --- погода -----------------------------------------------------------------
+
+async function handleWeatherCommand(message, place, addressed) {
+  const words = place.split(/\s+/).length;
+  typing(message.peer_id);
+  let r;
+  try {
+    r = await deps.getWeather(place);
+  } catch (e) {
+    console.error('[weather] ошибка:', e.message);
+    if (!addressed && words > 2) return IGNORED;
+    return replyTo(message, 'Не получилось получить погоду: сервис недоступен 😿 Попробуйте позже.');
+  }
+  if (!r.found) {
+    if (!addressed && words > 2) return IGNORED; // "погода сегодня отличная" — обычная фраза
+    return replyTo(message, `Не нашёл населённый пункт «${place}». Напишите название точнее, например: погода Москва`);
+  }
+  return replyTo(message, r.text);
+}
+
+// --- подарок кристаллов -----------------------------------------------------
+
+async function handleGiftCommand(message, args) {
+  const peerId = message.peer_id;
+  const parsed = parseDuelArgs(args);
+  const token = parsed.mentionId ? `[id${parsed.mentionId}|x]` : parsed.screen ? `@${parsed.screen}` : '';
+  const target = await resolveTarget(message, token);
+  if (!target.id) {
+    if (target.notFound) return replyTo(message, 'Не нашёл такого пользователя. Проверьте username или ответьте на его сообщение.');
+    return replyTo(message, 'Ответьте на сообщение пользователя или укажите его username, чтобы даровать ему кристаллы. Например: даровать 50');
+  }
+  if (target.id === message.from_id) return replyTo(message, 'Нельзя даровать кристаллы самому себе 🙂');
+
+  const amount = parsed.amount;
+  if (!amount || !Number.isSafeInteger(amount) || amount < 1) {
+    return replyTo(message, 'Укажите количество кристаллов, например: даровать 50');
+  }
+
+  const names = await getUserNames([message.from_id, target.id]); // до списания: дальше await нет
+  const from = getStat(peerId, message.from_id);
+  if (from.crystals < amount) {
+    return replyTo(message, `Не хватает кристаллов: у вас ${from.crystals} ${pluralCrystals(from.crystals)}, а вы хотите даровать ${amount}.`);
+  }
+  const to = getStat(peerId, target.id);
+  from.crystals -= amount;
+  to.crystals += amount;
+  scheduleStatsSave();
+  console.log(`[gift] peer=${peerId} ${message.from_id} -> ${target.id}: ${amount}`);
+  return replyTo(
+    message,
+    `🎁 ${names.get(message.from_id)} дарит [id${target.id}|${names.get(target.id)}] ${amount} ${pluralCrystals(amount)}`,
+    { disable_mentions: 0 }
+  );
+}
+
+// --- /ии: проверка подключённых нейросетей (только админы) -------------------
+
+async function handleAiStatus(message) {
+  if (!(await isChatAdmin(message.peer_id, message.from_id))) return;
+  const names = deps.ai.names();
+  if (!names.length) return replyTo(message, `${NO_AI_TEXT}\nЯ ищу ключи в переменных: GROQ_KEY, CEREBRAS_KEY, OPENROUTER_KEY, MISTRAL_KEY, GITHUB_MODELS_KEY, SAMBANOVA_KEY, CF_API_TOKEN + CF_ACCOUNT_ID, TOGETHER_KEY, HF_TOKEN, SILICONFLOW_KEY.`);
+  typing(message.peer_id);
+  const results = await deps.ai.test();
+  const lines = results.map((r) => (r.ok ? `✅ ${r.name} — ${r.model} (${r.ms} мс)` : `❌ ${r.name} — ${r.error}`));
+  const ok = results.filter((r) => r.ok).length;
+  lines.push('', `Рабочих: ${ok} из ${results.length}`, `Рисунки и графики в PNG: ${render.available() ? 'включены' : 'выключены (не установлен @resvg/resvg-js)'}`);
+  return replyTo(message, `🤖 Нейросети:\n${lines.join('\n')}`);
+}
+
 async function handleCommand({ cmd, args }, message) {
   if (cmd === 'правила') return handleRulesCommand(message);
   if (cmd === 'команды') return handleCommandsList(message);
   if (cmd === 'бан') return handleBanCommand(message);
   if (cmd === 'кристаллы') return handleCrystalsCommand(message, args);
   if (cmd === 'монетка') return handleDuelCommand(message, args);
+  if (cmd === 'даровать') return handleGiftCommand(message, args);
+  if (cmd === 'погода') return handleWeatherCommand(message, args, false);
+  if (cmd === 'график') return handleGraphCommand(message, args, false);
+  if (cmd === 'ии') return handleAiStatus(message);
   if (cmd === 'огоньки' || cmd === 'серии') return handleStreaksList(message);
   if (cmd === 'огонек' || cmd === 'обнять' || cmd === 'снежок') return handleSocialCommand(cmd, message, args);
   if (cmd === 'запретить' || cmd === 'разрешить') return handleWordCommand(cmd, message, args);
@@ -1330,11 +1716,20 @@ async function handleMessage(message, edited = false) {
     streaks.recordReply(peerId, message.from_id, message.reply_message.from_id);
   }
 
-  // Команда — выполняем (кристаллы за неё не дают).
-  if (parsed) return handleCommand(parsed, message);
+  // Команда — выполняем (кристаллы за неё не дают). Если обработчик решил, что
+  // это была просто фраза, а не команда (IGNORED), сообщение идёт дальше как обычное.
+  if (parsed) {
+    const r = await handleCommand(parsed, message);
+    if (r !== IGNORED) return r;
+  }
 
   // Обычное сообщение — начисляем кристаллы (правки не считаются).
-  if (!edited) addCrystals(peerId, message.from_id);
+  if (edited) return;
+  addCrystals(peerId, message.from_id);
+
+  // Обратились к Катёнку (по имени, упоминанию или reply на её ответ) — отвечает нейросеть.
+  const req = detectAiRequest(message);
+  if (req) return handleAiRequest(message, req);
 }
 
 // ---------------------------------------------------------------------------
@@ -1420,6 +1815,7 @@ async function start() {
   const nStreaks = streaks.load(STREAKS_FILE);
   streaks.setPersist(true);
   console.log(`Серии (${STREAKS_FILE}): ${nStreaks}`);
+  console.log(`Нейросети: ${aiClient.names().join(', ') || 'не подключены (нет ключей)'}; PNG-рендер: ${render.available() ? 'да' : 'нет (установите @resvg/resvg-js)'}`);
   setInterval(() => runStreakTick(), 30 * 1000);
   const flush = () => {
     saveStatsNow();
@@ -1468,6 +1864,10 @@ module.exports = {
   pluralCrystals,
   deleteSentLater,
   streaks,
+  _deps: deps,
+  detectAiRequest,
+  handleAiRequest,
+  aiHistory,
   runStreakTick,
   getUserNames,
   _setUploader: (fn) => {
