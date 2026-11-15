@@ -11,7 +11,7 @@ const { checkForbidden, loadBlocklist } = require('./forbidden');
 const { createStore } = require('./streaks');
 const aiLib = require('./ai');
 const { buildGraph, GraphError } = require('./graph');
-const { getWeather } = require('./weather');
+const { getWeather, getTime } = require('./weather');
 const render = require('./render');
 
 // ---------------------------------------------------------------------------
@@ -600,6 +600,9 @@ const TOKEN_RE = new RegExp(`^${TARGET_SRC}$`, 'i');
 const GIFT_RE = new RegExp(`^\\/?(?:(${TARGET_SRC})\\s+)?даровать(?:\\s+([\\s\\S]*))?$`, 'i');
 // "погода Москва", "погода в Санкт-Петербурге".
 const WEATHER_RE = /^\/?погода(?:\s+(?:в|во|для)\s+|\s+)(\S[\s\S]{1,58})$/i;
+// "время в Омске", "который час в Токио", "сколько времени в Дели"; "время Омск" — только с заглавной буквы.
+const TIME_PREP_RE = /^\/?(?:время|который\s+час|сколько\s+(?:сейчас\s+)?времени)\s+(?:в|во|для)\s+(\S[\s\S]{1,58}?)\s*[?!.]*$/i;
+const TIME_BARE_RE = /^\/?(?:время|час)\s+(\p{Lu}[\p{L}\-]{1,40})\s*[?!.]*$/u;
 const PLACE_RE = /^[\p{L}\d][\p{L}\d\s.,'\-]{1,59}$/u;
 // "график y = x^2", "построй график sin(x); cos(x) от -5 до 5".
 const GRAPH_RE = /^\/?(?:(?:построй|нарисуй|покажи|сделай)\s+)?(?:график[и]?|plot)\s+(?:функци[июй]\s+)?([\s\S]{1,200})$/i;
@@ -643,6 +646,8 @@ function parseCommand(text) {
   }
   m = WEATHER_RE.exec(t);
   if (m && PLACE_RE.test(m[1].trim()) && m[1].trim().split(/\s+/).length <= 4) return { cmd: 'погода', args: m[1].trim() };
+  m = TIME_PREP_RE.exec(t) || TIME_BARE_RE.exec(t);
+  if (m && PLACE_RE.test(m[1].trim()) && m[1].trim().split(/\s+/).length <= 4) return { cmd: 'время', args: m[1].trim() };
   m = GRAPH_RE.exec(t);
   if (m) return { cmd: 'график', args: m[1].trim() };
   for (const { cmd, re } of SOCIAL) {
@@ -751,6 +756,7 @@ function commandsText() {
     '❄️ снежок — кинуть в пользователя снежок (reply или @ник)',
     '🎁 даровать 50 — подарить кристаллы: ответьте на сообщение участника или укажите его @ник',
     '🌦 погода Москва — погода в любом населённом пункте',
+    '🕒 время Омск — точное время в любом городе (или «Катёнак, который час в Токио?»)',
     '📈 график y = x^2 — график функции; можно несколько через «;» и диапазон: график sin(x); cos(x) от -6 до 6',
     '🐱 Катёнак, <вопрос> — нейросеть: ответит на вопрос, решит задачу. «Катёнак, нарисуй кота» — нарисует SVG-картинку',
     '',
@@ -758,7 +764,6 @@ function commandsText() {
     '🔨 бан — исключить участника: ответьте этой командой на его сообщение',
     '🚫 /запретить слово — добавить слово в список удаляемых сообщений',
     '✅ /разрешить слово — убрать слово из этого списка',
-    '🤖 /ии — проверить, какие нейросети подключены и работают',
   ].join('\n');
 }
 
@@ -1281,6 +1286,7 @@ const IGNORED = Symbol('ignored'); // обработчик решил, что э
 const deps = {
   ai: aiClient,
   getWeather,
+  getTime,
   uploadPhoto: (buf, name, peerId) => uploadPhotoBuffer(buf, name, peerId),
   uploadDoc: (buf, name, peerId) => uploadDocBuffer(buf, name, peerId),
 };
@@ -1430,6 +1436,10 @@ function detectAiRequest(message) {
   return addressed ? { text } : null;
 }
 
+// "Катёнак, который час в Омске?", "сколько сейчас времени в Токио", "какое сегодня число"
+const TIME_NL_RE = /^(?:(?:а|и|ну|подскажи|скажи|подскажите|скажите)[,\s]+)*(?:который\s+(?:сейчас\s+)?час|сколько\s+(?:сейчас\s+)?времени|какое\s+(?:сейчас\s+)?время|время(?:\s+сейчас)?)(?:\s+сейчас)?(?:\s+(?:в|во|для)\s+([\p{L}][\p{L}\s.\-]{1,40}?))?(?:\s+сейчас)?\s*[?!.]*$/iu;
+const TIME_NL2_RE = /^(?:а\s+)?(?:в|во)\s+([\p{L}][\p{L}\s.\-]{1,40}?)\s+(?:который\s+(?:сейчас\s+)?час|сколько\s+(?:сейчас\s+)?времени)\s*[?!.]*$/iu;
+const DATE_NL_RE = /^(?:а\s+)?(?:какое|какая|какой)\s+(?:сегодня|сейчас)\s+(?:число|дата|день(?:\s+недели)?)\s*[?!.]*$/iu;
 const WEATHER_NL_RE = /погод\w*\s+(?:сейчас\s+|сегодня\s+|завтра\s+)?(?:в|во|для)\s+([\p{L}][\p{L}\s.\-]{1,40}?)\s*[?!.]*$/iu;
 
 async function handleAiRequest(message, req) {
@@ -1443,6 +1453,8 @@ async function handleAiRequest(message, req) {
   if (kind) return sendAiText(message, aiLib.cannedAnswer(kind));
 
   // 2) Команды, сказанные Катёнку: "Катёнак, погода Москва", "Катёнак, график sin(x)".
+  const tm = TIME_NL_RE.exec(text) || TIME_NL2_RE.exec(text) || DATE_NL_RE.exec(text);
+  if (tm) return handleTimeCommand(message, (tm[1] || '').trim(), true);
   const w = WEATHER_RE.exec(text) || WEATHER_NL_RE.exec(text);
   if (w) return handleWeatherCommand(message, w[1].trim(), true);
   const g = GRAPH_RE.exec(text);
@@ -1465,7 +1477,8 @@ async function handleAiChat(message, text) {
 
   const key = `${message.peer_id}:${message.from_id}`;
   const quoted = message.reply_message && message.reply_message.text ? String(message.reply_message.text).slice(0, 800) : '';
-  const userContent = quoted ? `[Сообщение, на которое ответил пользователь: «${quoted}»]\n\n${text}` : text;
+  const body = quoted ? `[Сообщение, на которое ответил пользователь: «${quoted}»]\n\n${text}` : text;
+  const userContent = `${aiLib.PERSONA_NOTE}\n\n${body}`;
   const messages = [
     { role: 'system', content: aiLib.systemPrompt(new Date()) },
     ...getHistory(key),
@@ -1585,6 +1598,25 @@ async function handleWeatherCommand(message, place, addressed) {
   return replyTo(message, r.text);
 }
 
+// --- время в городах --------------------------------------------------------
+
+async function handleTimeCommand(message, place, addressed) {
+  let r;
+  try {
+    // без обращения к Катёнку отвечаем только по настоящим городам (не на фразы вроде "время в школе")
+    r = await deps.getTime(place, addressed ? undefined : { minPopulation: 20000 });
+  } catch (e) {
+    console.error('[time] ошибка:', e.message);
+    if (!addressed) return IGNORED;
+    return replyTo(message, 'Не получилось определить время: сервис недоступен 😿 Попробуйте позже.');
+  }
+  if (!r.found) {
+    if (!addressed) return IGNORED;
+    return replyTo(message, `Не нашёл населённый пункт «${place}». Напишите название точнее, например: время Омск`);
+  }
+  return replyTo(message, r.text);
+}
+
 // --- подарок кристаллов -----------------------------------------------------
 
 async function handleGiftCommand(message, args) {
@@ -1628,7 +1660,13 @@ async function handleAiStatus(message) {
   if (!names.length) return replyTo(message, `${NO_AI_TEXT}\nЯ ищу ключи в переменных: GROQ_KEY, CEREBRAS_KEY, OPENROUTER_KEY, MISTRAL_KEY, GITHUB_MODELS_KEY, SAMBANOVA_KEY, CF_API_TOKEN + CF_ACCOUNT_ID, TOGETHER_KEY, HF_TOKEN, SILICONFLOW_KEY.`);
   typing(message.peer_id);
   const results = await deps.ai.test();
-  const lines = results.map((r) => (r.ok ? `✅ ${r.name} — ${r.model} (${r.ms} мс)` : `❌ ${r.name} — ${r.error}`));
+  const human = (e) => {
+    if (/HTTP 40[13]/.test(e)) return 'ключ неверный или без прав — перевыпустите ключ';
+    if (/HTTP 402/.test(e)) return 'провайдер требует оплату/кредиты (бесплатный лимит недоступен)';
+    if (/HTTP 429/.test(e)) return 'лимит бесплатного тарифа, попробуйте позже';
+    return e.slice(0, 90);
+  };
+  const lines = results.map((r) => (r.ok ? `✅ ${r.name} — ${r.model} (${r.ms} мс)` : `❌ ${r.name} — ${human(r.error)}`));
   const ok = results.filter((r) => r.ok).length;
   lines.push('', `Рабочих: ${ok} из ${results.length}`, `Рисунки и графики в PNG: ${render.available() ? 'включены' : 'выключены (не установлен @resvg/resvg-js)'}`);
   return replyTo(message, `🤖 Нейросети:\n${lines.join('\n')}`);
@@ -1642,6 +1680,7 @@ async function handleCommand({ cmd, args }, message) {
   if (cmd === 'монетка') return handleDuelCommand(message, args);
   if (cmd === 'даровать') return handleGiftCommand(message, args);
   if (cmd === 'погода') return handleWeatherCommand(message, args, false);
+  if (cmd === 'время') return handleTimeCommand(message, args, false);
   if (cmd === 'график') return handleGraphCommand(message, args, false);
   if (cmd === 'ии') return handleAiStatus(message);
   if (cmd === 'огоньки' || cmd === 'серии') return handleStreaksList(message);
