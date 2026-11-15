@@ -48,23 +48,101 @@ async function getJson(fetchFn, url, timeoutMs = 10000) {
   }
 }
 
-// Ищет населённый пункт. Название в падеже ("в Москве") геокодер находит
+const normName = (x) => String(x || '').toLowerCase().replace(/ё/g, 'е');
+
+// Из нескольких найденных мест выбираем то, чьё название совпадает с запросом
+// (запрос может быть в падеже: "Омске" -> "Омск"), среди таких — самое населённое.
+function pickBest(results, query) {
+  const q = normName(query);
+  const byPop = [...results].sort((a, b) => (b.population || 0) - (a.population || 0));
+  const match = byPop.find((r) => {
+    const n = normName(r.name);
+    return q === n || q.startsWith(n.slice(0, Math.max(3, n.length - 2)));
+  });
+  return match || results[0];
+}
+
+// Ищет населённый пункт. Название в падеже ("в Омске") геокодер находит
 // нечётким поиском; если нет — пробуем обрезать окончание.
 async function geocode(name, fetchFn) {
   const variants = [name];
   if (name.length > 4) variants.push(name.slice(0, -1));
   if (name.length > 5) variants.push(name.slice(0, -2));
   for (const v of variants) {
-    const url = `${GEO_URL}?name=${encodeURIComponent(v)}&count=5&language=ru&format=json`;
+    const url = `${GEO_URL}?name=${encodeURIComponent(v)}&count=10&language=ru&format=json`;
     const data = await getJson(fetchFn, url);
-    if (data && Array.isArray(data.results) && data.results.length) return data.results[0];
+    if (data && Array.isArray(data.results) && data.results.length) return pickBest(data.results, name);
   }
   return null;
 }
 
+// ---------- время ----------
+
+const plural = (n, one, few, many) => {
+  const m10 = n % 10;
+  const m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return one;
+  if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+  return many;
+};
+
+// Смещение часового пояса от UTC в минутах на момент date (с учётом летнего времени).
+function offsetMinutes(tz, date) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric',
+  });
+  const p = {};
+  for (const part of dtf.formatToParts(date)) if (part.type !== 'literal') p[part.type] = Number(part.value);
+  const asUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+  return Math.round((asUtc - Math.floor(date.getTime() / 1000) * 1000) / 60000);
+}
+
+const utcLabel = (min) => {
+  const sign = min < 0 ? '−' : '+';
+  const a = Math.abs(min);
+  return `UTC${sign}${Math.floor(a / 60)}${a % 60 ? `:${String(a % 60).padStart(2, '0')}` : ''}`;
+};
+
+function formatTime({ label, tz }, now = new Date()) {
+  const time = new Intl.DateTimeFormat('ru-RU', { timeZone: tz, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(now);
+  const date = new Intl.DateTimeFormat('ru-RU', { timeZone: tz, weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })
+    .format(now).replace(/\s*г\.$/, '');
+  const off = offsetMinutes(tz, now);
+  const diff = off - offsetMinutes('Europe/Moscow', now);
+
+  let diffText;
+  if (tz === 'Europe/Moscow') diffText = null;
+  else if (diff === 0) diffText = 'Совпадает с московским временем';
+  else {
+    const h = Math.floor(Math.abs(diff) / 60);
+    const m = Math.abs(diff) % 60;
+    const amount = [h ? `${h} ${plural(h, 'час', 'часа', 'часов')}` : '', m ? `${m} мин` : ''].filter(Boolean).join(' ');
+    diffText = `${diff > 0 ? 'Впереди' : 'Позади'} Москвы на ${amount}`;
+  }
+  return [`🕒 ${label}`, '', `⏰ ${time}`, `📅 ${date}`, `🌍 ${tz} (${utcLabel(off)})`, diffText ? `↔ ${diffText}` : null].filter((x) => x !== null).join('\n');
+}
+
+// Время в населённом пункте. Часовой пояс берёт геокодер (IANA), время считает Node —
+// никаких "угадываний" смещений. Без названия — московское время.
+async function getTime(rawName, opts = {}) {
+  const fetchFn = opts.fetch || globalThis.fetch;
+  const now = opts.now || new Date();
+  const name = cleanName(rawName);
+  if (!name) return { found: true, text: formatTime({ label: 'Москва, Россия', tz: 'Europe/Moscow' }, now) };
+  const place = await geocode(name, fetchFn);
+  if (!place || !place.timezone) return { found: false };
+  if (opts.minPopulation && (place.population || 0) < opts.minPopulation) return { found: false };
+  const label = [place.name, place.admin1 && place.admin1 !== place.name ? place.admin1 : null, place.country].filter(Boolean).join(', ');
+  return { found: true, text: formatTime({ label, tz: place.timezone }, now), place: label };
+}
+
+function cleanName(raw) {
+  return String(raw || '').trim().replace(/^(?:в|во|для|на)\s+/i, '').replace(/^(?:городе|город|г\.|селе|посёлке)\s+/i, '').replace(/[?!."«»]+/g, '').trim();
+}
+
 // -> { found: false } или { found: true, text }
 async function getWeather(rawName, fetchFn = globalThis.fetch) {
-  const name = String(rawName || '').trim().replace(/^(?:в|во|для|на)\s+/i, '').replace(/^(?:городе|город|г\.|селе|посёлке)\s+/i, '').replace(/[?!."«»]+/g, '').trim();
+  const name = cleanName(rawName);
   if (name.length < 2) return { found: false };
 
   const place = await geocode(name, fetchFn);
@@ -110,4 +188,4 @@ async function getWeather(rawName, fetchFn = globalThis.fetch) {
   return { found: true, text: lines.join('\n'), place: where };
 }
 
-module.exports = { getWeather };
+module.exports = { getWeather, getTime, formatTime, offsetMinutes };
